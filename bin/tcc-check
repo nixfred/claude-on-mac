@@ -113,9 +113,22 @@ def shortcuts_cli() -> tuple[bool, str]:
     return proc.returncode == 0, f"{n} user shortcuts available"
 
 
+HEADS_UP_BANNER = """
+================================================================================
+  ⚠️  HEADS UP, BEFORE WE START:
+  macOS will show you up to FOUR "Allow" system dialogs in the next minute,
+  one each for Calendar, Reminders, Notes, and Mail.
+  WATCH YOUR SCREEN. Click "Allow" on each. Each has a 60-second window.
+  If you miss one: re-run `tcc-check`. If you hit "Don't Allow" by mistake,
+  fix it at System Settings → Privacy & Security → Automation.
+================================================================================
+"""
+
+
 def main() -> int:
     print("Apple ecosystem access: TCC check")
-    print("==================================\n")
+    print("==================================")
+    print(HEADS_UP_BANNER)
     print("Direct SQLite reads (need Full Disk Access):")
     a = check("Messages chat.db",       messages_db)
     b = check("Contacts AddressBook",   contacts_db)
@@ -131,10 +144,15 @@ def main() -> int:
     g = check("Notes: list folders",
               lambda: applescript("Notes",
                                   'tell application "Notes" to get name of every folder'))
+    # Mail joins the probe set so its Automation grant fires during the install
+    # ceremony, not silently on first use of `mail accounts` or `mail-send`.
+    i = check("Mail: list accounts",
+              lambda: applescript("Mail",
+                                  'tell application "Mail" to get name of every account'))
     print("\nShortcuts CLI:")
     h = check("shortcuts list",         shortcuts_cli)
 
-    all_ok = all([a, b, c, d, e, f, g, h])
+    all_ok = all([a, b, c, d, e, f, g, i, h])
     print()
     if all_ok:
         print("All checks passed.")

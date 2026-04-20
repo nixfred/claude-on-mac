@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.2.2 , 2026-04-20
+
+Second round of fixes from the cross-host install feedback. The v1.2.1 fixes all landed, but verifying them on the second Mac surfaced THREE more real UX issues, all addressed here.
+
+### Fixed
+- **`bin/tcc-check` now probes Mail.app too**. v1.2.1 probed Calendar / Reminders / Notes, but Mail was missing from the probe list — so Mail's TCC Automation dialog was firing silently on first use of `mail accounts` or `mail-send`, with no 60s warning and no install-time ceremony around it. Adding Mail to the probe set means all four writer apps (Calendar, Reminders, Notes, Mail) get their grants captured during install.
+- **`bin/tcc-check` prints a loud upfront banner** when it starts: "macOS will show you up to FOUR Allow dialogs in the next minute, WATCH YOUR SCREEN, click Allow on each." This is the single biggest UX fix in the whole install flow. The root cause of almost every "install looks broken" symptom was "the human didn't know dialogs were coming and had context-switched away." The banner + the per-probe 60s warning together solve it.
+- **`AGENTS.md` Step 4 preamble strengthened** with the verbatim user-facing warning the agent should say BEFORE firing tcc-check. No more hoping the agent figures out the right expectation-setting language.
+- **`AGENTS.md` Step 3.5 PATH remediation is now shell-aware**. v1.2.1 suggested `echo ... >> ~/.zshrc`, which silently fails for the ~half of macOS users who use bash (Apple shipped bash as default until macOS 10.15, plenty of users still running it). Now detects `$SHELL` and picks `~/.zshrc` or `~/.bashrc` accordingly. Also notes the `~/.bash_profile` gotcha (login shells source it AFTER `.bashrc`, so PATH manipulations there can override earlier work) and suggests auditing existing `export PATH` lines before adding a third.
+
+### Retracted (from the v1.2.1 feedback)
+- The `imsg recent doesn't exist` item was a false positive caused by the brew-installed Rust `imsg` CLI shadowing our helper in PATH. Our `imsg` does have `recent`; the nixf agent was invoking the wrong binary. Step 3.5 (PATH collision check) is the right fix, already in v1.2.1. Retraction captured in the nixf install feedback addendum.
+
 ## v1.2.1 , 2026-04-20
 
 Fixes from a real cross-host install on a second Mac. A separate Claude Code instance ran the one-paste install on another machine and logged 5 concrete issues. All addressed here.

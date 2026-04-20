@@ -100,27 +100,49 @@ imsg --help 2>&1 | head -3        # must include our subcommands: recent / from 
 
 If `command -v imsg` does NOT resolve to `~/bin/imsg` (or its real path `~/claude-on-mac/bin/imsg`), there is a collision. Two fixes:
 
-- **Easy:** Put `~/bin` first in `PATH` (edit `~/.zshrc` / `~/.bash_profile`, prepend not append) and open a new shell.
+- **Easy:** Put `~/bin` first in `PATH`. The target rc file depends on the user's shell. Detect it:
+
+  ```bash
+  case "$SHELL" in
+    */zsh)  rcfile="$HOME/.zshrc" ;;
+    */bash) rcfile="$HOME/.bashrc" ;;
+    *)      rcfile="(ask the user which rc file they use)" ;;
+  esac
+  echo "$rcfile"
+  ```
+
+  Then APPEND `export PATH="$HOME/bin:$PATH"` at the VERY END of that file (if multiple `export PATH=...` lines exist, the last one wins, so position matters). For bash users with BOTH `~/.bashrc` and `~/.bash_profile`, append to `~/.bash_profile` too — login shells source `.bash_profile` AFTER `.bashrc`, so any homebrew re-prepend there will still win unless your `~/bin` line comes after it.
+
+  A practical audit for the user's rc file before editing:
+  ```bash
+  grep -n '^export PATH' "$rcfile" ~/.bash_profile 2>/dev/null
+  ```
+  If you see multiple PATH exports, consolidate rather than adding a third — the user's PATH is already fighting itself.
+
 - **Safer if the user wants to keep the other tool:** rename our symlink: `mv ~/bin/imsg ~/bin/cmsg` and tell the user to invoke `cmsg` instead. Update the consent profile memory entry so future sessions know.
 
 Do NOT proceed to Step 5 until `command -v imsg` confirms our helper is the one being invoked.
 
 ### Step 4: Walk through TCC permissions
 
-Run the verifier:
+BEFORE you fire tcc-check, tell the user VERBATIM something like this (paraphrase OK but cover every point):
+
+> "Heads up: I'm about to run `tcc-check`. macOS will pop up FOUR 'Allow' system dialogs in the next minute, one each for Calendar, Reminders, Notes, and Mail. Please WATCH YOUR SCREEN. Click 'Allow' on each. Don't click 'Don't Allow' or dismiss the dialog, because if you do, the install stalls and you'll have to grant the permission manually in System Settings → Privacy & Security → Automation. Each dialog has a 60-second window. If you miss one, I'll just re-run tcc-check and it'll retry."
+
+This preamble is the single biggest UX improvement you can give the user. Without it, the install feels broken because the human doesn't know dialogs are coming. `tcc-check` itself also prints a matching banner when it starts, but tell the user first so they don't context-switch away.
+
+Now run the verifier:
 
 ```bash
 ~/bin/tcc-check
 ```
 
-It tries each access path and prints ✅ / ❌ for each one. The AppleScript probes (Calendar / Reminders / Notes) each allow up to 60 seconds for the user to click the TCC dialog that appears on first call. Tell the user:
+It tries each access path and prints ✅ / ❌ for each one. The AppleScript probes (Calendar / Reminders / Notes / Mail) each allow up to 60 seconds for the user to click the TCC dialog that appears on first call.
 
-> "I'm about to run tcc-check. On first run you'll see up to three `osascript wants to control <App>` dialogs. Click OK on each one within 60 seconds. If you miss one, re-run `tcc-check` after and it will retry."
-
-For every ❌ still remaining after the first run:
+For every ❌ remaining after the first run:
 
 - If it's a SQLite read failure → user needs to grant **Full Disk Access** to their terminal app or to Claude Code itself. Walk them through System Settings → Privacy & Security → Full Disk Access. They must quit and relaunch the terminal after granting.
-- If it's an AppleScript timeout → the dialog appeared but wasn't clicked within 60s. Re-run `tcc-check`. If the dialog doesn't re-appear, check System Settings → Privacy & Security → Automation manually.
+- If it's an AppleScript timeout → the dialog appeared but wasn't clicked within 60s (or was clicked "Don't Allow"). Re-run `tcc-check`. If the dialog doesn't re-appear, fix it at System Settings → Privacy & Security → Automation manually.
 
 Do NOT skip a failing check. Re-run `tcc-check` after each grant until everything is green (within the user's opted-in capabilities).
 
