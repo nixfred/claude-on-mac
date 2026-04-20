@@ -85,13 +85,18 @@ def mail_envelope() -> tuple[bool, str]:
 
 
 def applescript(app: str, query: str) -> tuple[bool, str]:
+    """Probe Automation grant via osascript. Timeout is 60s because on a
+    FIRST call (no prior grant), macOS pops a TCC dialog the user must click
+    within the window. Humans don't win 15-second shot clocks while
+    context-switching between terminal and a system dialog."""
     if not shutil.which("osascript"):
         return False, "osascript not on PATH"
+    print(f"     ⏳ approve any system dialog for {app} within 60s...", file=sys.stderr)
     proc = subprocess.run(
         ["osascript", "-e", query],
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=60,
     )
     if proc.returncode != 0:
         msg = proc.stderr.strip()[:120]

@@ -49,21 +49,33 @@ def osascript(src: str, timeout: int = 30) -> str:
 
 def cmd_list(args):
     con = open_db()
+    # Apple has at least six date-ish columns on ZICCLOUDSYNCINGOBJECT:
+    # ZMODIFICATIONDATE, ZMODIFICATIONDATE1, ZMODIFIEDDATE, ZCREATIONDATE,
+    # ZCREATIONDATE1, ZCREATIONDATE2. Which are populated varies by note
+    # source (iCloud-synced vs local, created-on-iOS vs macOS, etc.). We
+    # COALESCE the most-likely-populated ones so `note list` never shows
+    # "(unknown)" unless the note really has no timestamp anywhere.
     rows = con.execute("""
         SELECT
-          datetime(o.ZMODIFICATIONDATE+978307200,'unixepoch','localtime') AS modified,
+          datetime(
+            COALESCE(o.ZMODIFICATIONDATE, o.ZMODIFICATIONDATE1,
+                     o.ZMODIFIEDDATE,    o.ZCREATIONDATE2,
+                     o.ZCREATIONDATE1,   o.ZCREATIONDATE)
+            + 978307200, 'unixepoch','localtime') AS modified,
           o.ZTITLE1 AS title,
           f.ZTITLE2 AS folder
         FROM ZICCLOUDSYNCINGOBJECT o
         LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK = o.ZFOLDER
         WHERE o.ZTITLE1 IS NOT NULL
-        ORDER BY o.ZMODIFICATIONDATE DESC
+        ORDER BY COALESCE(o.ZMODIFICATIONDATE, o.ZMODIFICATIONDATE1,
+                          o.ZMODIFIEDDATE,    o.ZCREATIONDATE2,
+                          o.ZCREATIONDATE1,   o.ZCREATIONDATE) DESC
         LIMIT ?""", (args.n,)).fetchall()
     if args.json:
         print(json.dumps([dict(r) for r in rows], indent=2, ensure_ascii=False)); return
     for r in rows:
         folder = f"[{r['folder']}]  " if r["folder"] else ""
-        modified = r["modified"] or "(unknown)"
+        modified = r["modified"] or "(no date)"
         print(f"  {modified}  {folder}{r['title']}")
 
 

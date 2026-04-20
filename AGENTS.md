@@ -86,6 +86,25 @@ If the user opted out of, say, iMessage sending, do NOT symlink `imsg-send`. Tel
 
 Make sure `~/bin` is in their `PATH`. If it isn't, tell them how to add it (e.g., `echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc`).
 
+### Step 3.5: Check for `imsg` namespace collision (IMPORTANT)
+
+There is a pre-existing, unrelated `imsg` Rust CLI (version 0.5.x, subcommands `chats`/`history`/`watch`/`send`/`react`/`typing`/`rpc`) that some Macs have installed via `brew` or `cargo install`. If it's earlier in `PATH` than `~/bin`, our symlink gets shadowed silently and every `imsg` call you make will hit the wrong binary.
+
+Verify BEFORE smoke-testing:
+
+```bash
+hash -r                           # clear bash command cache
+command -v imsg                   # must resolve to ~/bin/imsg
+imsg --help 2>&1 | head -3        # must include our subcommands: recent / from / thread / search / contacts / chats / analyze
+```
+
+If `command -v imsg` does NOT resolve to `~/bin/imsg` (or its real path `~/claude-on-mac/bin/imsg`), there is a collision. Two fixes:
+
+- **Easy:** Put `~/bin` first in `PATH` (edit `~/.zshrc` / `~/.bash_profile`, prepend not append) and open a new shell.
+- **Safer if the user wants to keep the other tool:** rename our symlink: `mv ~/bin/imsg ~/bin/cmsg` and tell the user to invoke `cmsg` instead. Update the consent profile memory entry so future sessions know.
+
+Do NOT proceed to Step 5 until `command -v imsg` confirms our helper is the one being invoked.
+
 ### Step 4: Walk through TCC permissions
 
 Run the verifier:
@@ -94,10 +113,14 @@ Run the verifier:
 ~/bin/tcc-check
 ```
 
-It tries each access path and prints ✅ / ❌ for each one. For every ❌:
+It tries each access path and prints ✅ / ❌ for each one. The AppleScript probes (Calendar / Reminders / Notes) each allow up to 60 seconds for the user to click the TCC dialog that appears on first call. Tell the user:
+
+> "I'm about to run tcc-check. On first run you'll see up to three `osascript wants to control <App>` dialogs. Click OK on each one within 60 seconds. If you miss one, re-run `tcc-check` after and it will retry."
+
+For every ❌ still remaining after the first run:
 
 - If it's a SQLite read failure → user needs to grant **Full Disk Access** to their terminal app or to Claude Code itself. Walk them through System Settings → Privacy & Security → Full Disk Access. They must quit and relaunch the terminal after granting.
-- If it's an AppleScript failure → first AppleScript call to that app pops a TCC dialog automatically. Run a benign read once (e.g., `osascript -e 'tell application "Calendar" to get name of every calendar'`) so the dialog appears, and tell the user to click "OK".
+- If it's an AppleScript timeout → the dialog appeared but wasn't clicked within 60s. Re-run `tcc-check`. If the dialog doesn't re-appear, check System Settings → Privacy & Security → Automation manually.
 
 Do NOT skip a failing check. Re-run `tcc-check` after each grant until everything is green (within the user's opted-in capabilities).
 
@@ -110,7 +133,7 @@ For each enabled capability, run a tiny command and show the user the output:
 | Messages read | `imsg recent 3` |
 | Contacts | `contacts find <a-name-the-user-suggests>` |
 | Calendar | `cal calendars` then `cal week` |
-| Reminders | `rem lists` (note: Reminders.app via AppleScript is slow, 30s+ is normal) |
+| Reminders | `rem lists` (can be slow on machines where Reminders CloudKit is cold; usually 2-5s, sometimes 30s+) |
 | Notes | `note folders` then `note list 5` |
 | Mail read | `mail accounts` then `mail inbox 5` |
 | iMessage send (if enabled) | `imsg-send --self "claude install proof of life"` (DRY RUN only) |

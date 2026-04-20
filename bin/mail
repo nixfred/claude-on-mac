@@ -134,26 +134,54 @@ def cmd_domains(args):
 
 
 def cmd_accounts(args):
-    """Inferred from mailbox URLs in envelope index."""
-    db = find_envelope_index()
-    con = open_db(db)
-    rows = con.execute("""
-        SELECT DISTINCT
-          CASE
-            WHEN url LIKE '%imap-data://%' THEN 'IMAP'
-            WHEN url LIKE '%pop-data://%'  THEN 'POP'
-            WHEN url LIKE '%ews-data://%'  THEN 'Exchange'
-            WHEN url LIKE '%local-data://%' THEN 'Local'
-            ELSE 'Other'
-          END AS kind,
-          url
-        FROM mailboxes
-        WHERE url IS NOT NULL
-        ORDER BY url""").fetchall()
+    """List configured Mail.app accounts via AppleScript. Returns one row per
+    account with its display name and configured sending addresses. This is
+    the same query mail-send uses for `--from` validation, so the output
+    here lines up directly with what mail-send will accept."""
+    import shutil, subprocess
+    if not shutil.which("osascript"):
+        sys.exit("osascript not found (Mail.app queries require it)")
+    src = '''
+    tell application "Mail"
+      set out to ""
+      repeat with a in accounts
+        try
+          set acctName to name of a
+        on error
+          set acctName to "?"
+        end try
+        try
+          set addrs to email addresses of a
+        on error
+          set addrs to {}
+        end try
+        set out to out & acctName & "::"
+        repeat with addr in addrs
+          set out to out & (addr as text) & ","
+        end repeat
+        set out to out & linefeed
+      end repeat
+      return out
+    end tell
+    '''
+    proc = subprocess.run(["osascript", "-e", src], capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        sys.exit(f"Mail accounts query failed (grant Automation → Mail.app): {proc.stderr.strip()}")
+    accts = []
+    for line in proc.stdout.splitlines():
+        if "::" not in line:
+            continue
+        name, addrs = line.split("::", 1)
+        addrs_list = [x for x in addrs.strip().rstrip(",").split(",") if x]
+        accts.append({"name": name.strip(), "addresses": addrs_list})
     if args.json:
-        print(json.dumps([dict(r) for r in rows], indent=2)); return
-    for r in rows:
-        print(f"  {r['kind']:>10}  {r['url']}")
+        print(json.dumps(accts, indent=2, ensure_ascii=False)); return
+    if not accts:
+        print("No Mail.app accounts configured (is Mail.app running?)"); return
+    for a in accts:
+        print(f"{a['name']}:")
+        for addr in a["addresses"]:
+            print(f"  - {addr}")
 
 
 def find_emlx_for_message_id(rfc822_id: str) -> str | None:

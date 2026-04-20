@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.1 , 2026-04-20
+
+Fixes from a real cross-host install on a second Mac. A separate Claude Code instance ran the one-paste install on another machine and logged 5 concrete issues. All addressed here.
+
+### Fixed
+- **`tcc-check` osascript timeout bumped from 15s to 60s** on each AppleScript probe, with a "⏳ approve any system dialog within 60s" prompt printed before each one. Previously, on a clean machine with no prior Automation grants, the install looked like failure because the human couldn't click the TCC dialog within the 15-second shot clock.
+- **`bin/mail accounts`** now uses AppleScript to list configured Mail.app accounts with display name and primary addresses, same format as `mail-send accounts`. Previously it scraped the envelope SQLite `mailboxes` table and emitted one line per IMAP folder URL, which was useless for figuring out what to pass to `mail-send --from`.
+- **`bin/note list`** no longer shows "(unknown)" timestamps. Apple has ~6 date-ish columns on `ZICCLOUDSYNCINGOBJECT` (ZMODIFICATIONDATE, ZMODIFICATIONDATE1, ZMODIFIEDDATE, ZCREATIONDATE, ZCREATIONDATE1, ZCREATIONDATE2) and which are populated varies by note origin. We now `COALESCE` across all six.
+- **`AGENTS.md` Step 3.5 added**: explicit `imsg` namespace-collision check. A pre-existing Rust `imsg` CLI (version 0.5.x, installed via brew/cargo on some Macs) can shadow our helper if it's earlier in PATH. Protocol now runs `command -v imsg` and `imsg --help` to verify our helper is the one being invoked before smoke-testing.
+- **`AGENTS.md` Reminders slowness caveat softened**: "can be slow on machines where Reminders CloudKit is cold; usually 2-5s, sometimes 30s+" instead of the blanket "30s+ is normal" claim, which was host-specific to the build machine.
+- **`AGENTS.md` Step 4 text**: explicit user-facing prompt ("I'm about to run tcc-check. You'll see up to three dialogs. Click OK on each within 60 seconds.") so the agent can set expectations before firing the probes.
+
 ## v1.2.0 , 2026-04-20
 
 ### Added
