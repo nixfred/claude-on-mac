@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""
+mail-send: send / reply via Apple Mail.app, account-aware.
+
+█ HARD RULE
+█ This tool is consent-gated. It defaults to DRY-RUN. You MUST pass --yes for
+█ each individual send. Auto modes, batch loops, and "approved earlier" do NOT
+█ override the per-send authorization. See CONSENT.md in the repo root.
+
+Subcommands:
+  accounts                            list configured Mail.app accounts
+  compose                             compose and send a new message
+  reply                               reply to an existing message in a mailbox
+
+Compose flags:
+  --from <hint>                       which account to send from (REQUIRED)
+                                      Hints: an account NAME ("Google", "iCloud"),
+                                      a substring of an address ("gmail", "@mac.com"),
+                                      or a full address. The first matching configured
+                                      address is used.
+  --to a@b.c [--to ...]               recipient(s); repeat for multiple
+  --cc / --bcc                        cc / bcc recipients
+  --subject "..."
+  --body "..."                        body text (or pipe via stdin)
+  --yes                               actually send (default: dry-run)
+  --keep-dashes                       skip em/en-dash auto-scrub (default scrubs)
+
+Reply flags:
+  --to-message-id "<...>"             RFC822 Message-ID of the message you're replying to
+  --to-search "subject substring"     alternatively: most recent match wins
+  --reply-all                         reply to all (default: reply to sender only)
+  --body "..."                        reply body (or stdin)
+  --from <hint>                       which account to use; default = the receiving account
+  --yes                               actually send
+
+Examples:
+  mail-send accounts
+  mail-send compose --from gmail --to alice@example.com --subject Hi --body "hello"
+  mail-send compose --from "iCloud" --to alice@example.com --subject Hi --body "hi" --yes
+  echo "long body" | mail-send compose --from gmail --to a@b.c --subject "..." --yes
+  mail-send reply --to-search "Project sync" --body "Confirming." --yes
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+
+
+# ---------- dash scrub (no-dashes editorial rule) ----------
+
+DASH_RE = re.compile(r"\s*[\u2014\u2013\u2015]\s*")
+DDASH_RE = re.compile(r"\s*--\s*")
+
+
+def scrub_dashes(text: str) -> tuple[str, int]:
+    n = len(DASH_RE.findall(text)) + len(DDASH_RE.findall(text))
+    out = DASH_RE.sub(", ", text)
+    out = DDASH_RE.sub(", ", out)
+    out = re.sub(r",\s*,", ",", out)
+    return out, n
+
+
+# ---------- AppleScript runner ----------
+
+
+def osascript(src: str, timeout: int = 30) -> tuple[int, str, str]:
+    if not shutil.which("osascript"):
+        sys.exit("osascript not found")
+    proc = subprocess.run(
+        ["osascript", "-e", src], capture_output=True, text=True, timeout=timeout
+    )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def run_or_die(src: str) -> str:
+    rc, out, err = osascript(src)
+    if rc != 0:
+        sys.exit(f"AppleScript error: {err.strip()}")
+    return out
+
+
+# ---------- accounts ----------
+
+
+def list_accounts() -> list[dict]:
+    """Enumerate Mail.app accounts and the email addresses each is configured to send from.
+    Returns [{name, addresses[]}]."""
+    src = '''
+    tell application "Mail"
+      set out to ""
+      repeat with a in accounts
+        try
+          set acctName to name of a
+        on error
+          set acctName to "?"
+        end try
+        try
+          set addrs to email addresses of a
+        on error
+          set addrs to {}
+        end try
+        set out to out & acctName & "::"
+        repeat with addr in addrs
+          set out to out & (addr as text) & ","
+        end repeat
+        set out to out & linefeed
+      end repeat
+      return out
+    end tell
+    '''
+    rc, raw, err = osascript(src)
+    if rc != 0:
+        sys.exit(f"Mail accounts query failed: {err}")
+    accts = []
+    for line in raw.splitlines():
+        if "::" not in line:
+            continue
+        name, addrs = line.split("::", 1)
+        accts.append({
+            "name": name.strip(),
+            "addresses": [a for a in addrs.strip().rstrip(",").split(",") if a],
+        })
+    return accts
+
+
+def resolve_sender(hint: str) -> tuple[str, str]:
+    """Match the user's --from hint against configured Mail.app accounts.
+    Returns (matched_address, account_name). Hint may be:
+      * exact full email address
+      * substring of an address ('gmail', '@mac.com')
+      * substring of an account name ('Google', 'iCloud')
+    First match wins. Errors out if nothing matches."""
+    accts = list_accounts()
+    if not accts:
+        sys.exit("error: no Mail.app accounts configured")
+    h = hint.strip().lower()
+
+    # Exact address match first
+    for a in accts:
+        for addr in a["addresses"]:
+            if addr.lower() == h:
+                return addr, a["name"]
+    # Substring of address
+    for a in accts:
+        for addr in a["addresses"]:
+            if h in addr.lower():
+                return addr, a["name"]
+    # Substring of account name
+    for a in accts:
+        if h in a["name"].lower():
+            if a["addresses"]:
+                return a["addresses"][0], a["name"]
+
+    available = [(a["name"], a["addresses"]) for a in accts]
+    sys.exit(
+        f"error: --from {hint!r} matched no configured account.\n"
+        f"available accounts: {available}"
+    )
+
+
+# ---------- compose ----------
+
+
+def applescript_compose(sender_label: str, to: list[str], cc: list[str],
+                        bcc: list[str], subject: str, body: str) -> str:
+    def esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    lines = ['tell application "Mail"']
+    lines.append(
+        f'  set newMsg to make new outgoing message with properties '
+        f'{{subject:"{esc(subject)}", content:"{esc(body)}", '
+        f'sender:"{esc(sender_label)}", visible:false}}'
+    )
+    lines.append("  tell newMsg")
+    for r in to:
+        lines.append(
+            f'    make new to recipient at end of to recipients '
+            f'with properties {{address:"{esc(r)}"}}'
+        )
+    for r in cc:
+        lines.append(
+            f'    make new cc recipient at end of cc recipients '
+            f'with properties {{address:"{esc(r)}"}}'
+        )
+    for r in bcc:
+        lines.append(
+            f'    make new bcc recipient at end of bcc recipients '
+            f'with properties {{address:"{esc(r)}"}}'
+        )
+    lines.append("    send")
+    lines.append("  end tell")
+    lines.append("end tell")
+    return "\n".join(lines)
+
+
+def consent_banner(acct_name: str, sender: str, recipients: list[str], subject: str) -> None:
+    """Loud reminder printed immediately before any actual send."""
+    print("=" * 72, file=sys.stderr)
+    print("  CONSENT-GATED SEND  (this is a real outbound email)", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print(f"  account : {acct_name}", file=sys.stderr)
+    print(f"  from    : {sender}", file=sys.stderr)
+    print(f"  to      : {', '.join(recipients)}", file=sys.stderr)
+    print(f"  subject : {subject!r}", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+
+
+def cmd_compose(args):
+    if not args.from_:
+        sys.exit("error: --from is required (account name, address, or substring)")
+    matched_addr, acct_name = resolve_sender(args.from_)
+
+    if not args.to:
+        sys.exit("error: at least one --to recipient required")
+    if not args.subject:
+        sys.exit("error: --subject required")
+    body = args.body
+    if body is None:
+        body = sys.stdin.read() if not sys.stdin.isatty() else ""
+    body = body.rstrip()
+    if not body:
+        sys.exit("error: empty body (use --body or pipe via stdin)")
+
+    if not args.keep_dashes:
+        cleaned, n = scrub_dashes(body)
+        if n:
+            print(f"note: scrubbed {n} dash char(s) from body per no-dashes rule.",
+                  file=sys.stderr)
+            body = cleaned
+        cleaned_subj, n = scrub_dashes(args.subject)
+        if n:
+            print(f"note: scrubbed {n} dash char(s) from subject.", file=sys.stderr)
+            args.subject = cleaned_subj
+
+    script = applescript_compose(matched_addr, args.to, args.cc or [], args.bcc or [],
+                                  args.subject, body)
+
+    if not args.yes:
+        print("DRY RUN (pass --yes to actually send)")
+        print(f"account : {acct_name}")
+        print(f"from    : {matched_addr}")
+        print(f"to      : {args.to}")
+        if args.cc: print(f"cc      : {args.cc}")
+        if args.bcc: print(f"bcc     : {args.bcc}")
+        print(f"subject : {args.subject!r}")
+        print(f"body    : {body[:200]!r}{'...' if len(body) > 200 else ''}")
+        print("AppleScript:")
+        for line in script.splitlines():
+            print(f"  {line}")
+        return
+
+    consent_banner(acct_name, matched_addr, args.to, args.subject)
+    out = run_or_die(script)
+    if out and out.lower().startswith("false"):
+        sys.exit(f"Mail.app reported send failure: {out}")
+    print("sent.")
+
+
+# ---------- reply ----------
+
+
+def cmd_reply(args):
+    if not (args.to_message_id or args.to_search):
+        sys.exit("error: pass --to-message-id or --to-search")
+    body = args.body
+    if body is None:
+        body = sys.stdin.read() if not sys.stdin.isatty() else ""
+    body = body.rstrip()
+    if not body:
+        sys.exit("error: empty reply body")
+
+    if not args.keep_dashes:
+        cleaned, n = scrub_dashes(body)
+        if n:
+            print(f"note: scrubbed {n} dash char(s) from reply body.", file=sys.stderr)
+            body = cleaned
+
+    def esc(s): return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    if args.to_message_id:
+        predicate = f'message id is "{esc(args.to_message_id)}"'
+        match_label = f'message-id={args.to_message_id}'
+    else:
+        predicate = f'subject contains "{esc(args.to_search)}"'
+        match_label = f'subject~={args.to_search!r}'
+
+    sender_clause = ""
+    sender_label = "(use receiving account)"
+    if args.from_:
+        s, acct_name = resolve_sender(args.from_)
+        sender_clause = f'set sender of replyMsg to "{esc(s)}"'
+        sender_label = f"{acct_name} <{s}>"
+
+    reply_all = "true" if args.reply_all else "false"
+
+    script = f'''
+    tell application "Mail"
+      set candidates to {{}}
+      repeat with mb in (every mailbox of (every account))
+        try
+          set found to (messages of mb whose {predicate})
+          if (count of found) > 0 then set candidates to candidates & found
+        end try
+      end repeat
+      if (count of candidates) = 0 then error "no matching message found"
+      set targetMsg to item -1 of candidates
+      set replyMsg to reply targetMsg opening window with reply to all:{reply_all}
+      tell replyMsg
+        set content to "{esc(body)}" & return & return & content
+        {sender_clause}
+        send
+      end tell
+    end tell
+    '''.strip()
+
+    if not args.yes:
+        print("DRY RUN (pass --yes to actually send)")
+        print(f"reply-all : {bool(args.reply_all)}")
+        print(f"match     : {match_label}")
+        print(f"from      : {sender_label}")
+        print(f"body      : {body[:200]!r}{'...' if len(body) > 200 else ''}")
+        print("AppleScript:")
+        for line in script.splitlines():
+            print(f"  {line}")
+        return
+
+    print("=" * 72, file=sys.stderr)
+    print("  CONSENT-GATED REPLY  (this is a real outbound email)", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print(f"  match : {match_label}", file=sys.stderr)
+    print(f"  from  : {sender_label}", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    out = run_or_die(script)
+    print("sent.")
+
+
+# ---------- accounts subcommand ----------
+
+
+def cmd_accounts(args):
+    accts = list_accounts()
+    if not accts:
+        print("No Mail.app accounts found (is Mail.app running and configured?)")
+        return
+    for a in accts:
+        print(f"{a['name']}:")
+        for addr in a["addresses"]:
+            print(f"  - {addr}")
+
+
+# ---------- main ----------
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("accounts"); s.set_defaults(func=cmd_accounts)
+
+    s = sub.add_parser("compose")
+    s.add_argument("--from", dest="from_", help="account name, address, or substring")
+    s.add_argument("--to", action="append")
+    s.add_argument("--cc", action="append")
+    s.add_argument("--bcc", action="append")
+    s.add_argument("--subject")
+    s.add_argument("--body")
+    s.add_argument("--yes", action="store_true")
+    s.add_argument("--keep-dashes", action="store_true")
+    s.set_defaults(func=cmd_compose)
+
+    s = sub.add_parser("reply")
+    s.add_argument("--to-message-id")
+    s.add_argument("--to-search")
+    s.add_argument("--reply-all", action="store_true")
+    s.add_argument("--from", dest="from_")
+    s.add_argument("--body")
+    s.add_argument("--yes", action="store_true")
+    s.add_argument("--keep-dashes", action="store_true")
+    s.set_defaults(func=cmd_reply)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

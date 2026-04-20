@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""
+tcc-check: verify Larry's TCC permissions for Apple-app access.
+
+Tries each access path and reports ✅ / ❌ with the remediation.
+Exits 0 if everything works, non-zero if anything is missing.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from glob import glob
+
+
+def check(label: str, fn) -> bool:
+    try:
+        ok, detail = fn()
+    except Exception as e:
+        ok, detail = False, f"exception: {e!r}"
+    icon = "✅" if ok else "❌"
+    print(f"  {icon}  {label:<40} {detail}")
+    return ok
+
+
+def messages_db() -> tuple[bool, str]:
+    db = os.path.expanduser("~/Library/Messages/chat.db")
+    if not os.path.exists(db):
+        return False, "chat.db not found (Messages.app never run?)"
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        n = con.execute("SELECT COUNT(*) FROM message").fetchone()[0]
+        return True, f"{n:,} messages readable"
+    except sqlite3.DatabaseError as e:
+        return False, f"open failed: {e} → grant Full Disk Access"
+
+
+def contacts_db() -> tuple[bool, str]:
+    paths = glob(
+        os.path.expanduser(
+            "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
+        )
+    )
+    if not paths:
+        return False, "no Contacts source DBs found"
+    try:
+        total = 0
+        for p in paths:
+            con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            total += con.execute("SELECT COUNT(*) FROM ZABCDRECORD").fetchone()[0]
+        return True, f"{total:,} records across {len(paths)} sources"
+    except sqlite3.DatabaseError as e:
+        return False, f"open failed: {e}"
+
+
+def notes_db() -> tuple[bool, str]:
+    db = os.path.expanduser(
+        "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+    )
+    if not os.path.exists(db):
+        return False, "NoteStore.sqlite not found"
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        n = con.execute(
+            "SELECT COUNT(*) FROM ZICCLOUDSYNCINGOBJECT WHERE ZTITLE1 IS NOT NULL"
+        ).fetchone()[0]
+        return True, f"{n:,} notes (titles) readable"
+    except sqlite3.DatabaseError as e:
+        return False, f"open failed: {e} → grant Full Disk Access"
+
+
+def mail_envelope() -> tuple[bool, str]:
+    candidates = sorted(glob(os.path.expanduser("~/Library/Mail/V*/MailData/Envelope Index")))
+    if not candidates:
+        return False, "Mail Envelope Index not found"
+    try:
+        con = sqlite3.connect(f"file:{candidates[-1]}?mode=ro", uri=True)
+        n = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        return True, f"{n:,} messages indexed in {os.path.basename(os.path.dirname(os.path.dirname(candidates[-1])))}"
+    except sqlite3.DatabaseError as e:
+        return False, f"open failed: {e} → grant Full Disk Access"
+
+
+def applescript(app: str, query: str) -> tuple[bool, str]:
+    if not shutil.which("osascript"):
+        return False, "osascript not on PATH"
+    proc = subprocess.run(
+        ["osascript", "-e", query],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if proc.returncode != 0:
+        msg = proc.stderr.strip()[:120]
+        return False, f"osascript failed: {msg} → grant Automation → {app}"
+    out = proc.stdout.strip().replace("\n", " ")[:80]
+    return True, f"{out}"
+
+
+def shortcuts_cli() -> tuple[bool, str]:
+    if not shutil.which("shortcuts"):
+        return False, "shortcuts CLI missing (Shortcuts.app not installed?)"
+    proc = subprocess.run(["shortcuts", "list"], capture_output=True, text=True, timeout=10)
+    n = len([l for l in proc.stdout.splitlines() if l.strip()])
+    return proc.returncode == 0, f"{n} user shortcuts available"
+
+
+def main() -> int:
+    print("Apple ecosystem access: TCC check")
+    print("==================================\n")
+    print("Direct SQLite reads (need Full Disk Access):")
+    a = check("Messages chat.db",       messages_db)
+    b = check("Contacts AddressBook",   contacts_db)
+    c = check("Notes NoteStore",        notes_db)
+    d = check("Mail Envelope Index",    mail_envelope)
+    print("\nAppleScript (need Automation grants per app):")
+    e = check("Calendar: list calendars",
+              lambda: applescript("Calendar",
+                                  'tell application "Calendar" to get name of every calendar'))
+    f = check("Reminders: list lists",
+              lambda: applescript("Reminders",
+                                  'tell application "Reminders" to get name of every list'))
+    g = check("Notes: list folders",
+              lambda: applescript("Notes",
+                                  'tell application "Notes" to get name of every folder'))
+    print("\nShortcuts CLI:")
+    h = check("shortcuts list",         shortcuts_cli)
+
+    all_ok = all([a, b, c, d, e, f, g, h])
+    print()
+    if all_ok:
+        print("All checks passed.")
+        return 0
+    print("Some checks failed. See `docs/tcc-permissions.md` for remediation.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

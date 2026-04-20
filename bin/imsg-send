@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""
+imsg-send: send an iMessage / SMS / RCS via Messages.app (AppleScript bridge).
+
+█ HARD RULE
+█ This tool is consent-gated. It defaults to DRY-RUN. You MUST pass --yes for
+█ each individual send. Auto modes, batch loops, and "approved earlier" do NOT
+█ override the per-send authorization. See CONSENT.md in the repo root.
+
+Usage:
+  imsg-send --to <handle> [--service iMessage|SMS|RCS] [--yes] <text>...
+  imsg-send --chat-id <chat-guid> [--yes] <text>...
+  imsg-send --self [--yes] <text>...                 # send to your own iMessage
+  imsg-send --list-services
+  imsg-send --list-self                              # show auto-detected self handles
+
+Examples:
+  imsg-send --to +15551234567 "On my way"            # dry run, prints AppleScript
+  imsg-send --to +15551234567 --yes "On my way"      # actually sends iMessage
+  imsg-send --to alice@icloud.com --yes "hi"         # send to email handle
+  imsg-send --self --yes "test from claude"          # send to yourself
+
+Safety:
+  * No --yes => dry run, prints the AppleScript that would have run
+  * Refuses empty messages and messages > 4000 chars (Messages will fragment longer)
+  * Verifies a prior chat exists before SMS/RCS sends (those need iPhone Continuity)
+  * Auto-scrubs em/en dashes from outbound text (--keep-dashes overrides)
+  * Loud per-send authorization banner before transmit
+
+How it works:
+  Calls osascript with `tell application "Messages" to send <text> to participant
+  <handle> of service <id>`. Discovers the right service id by enumerating Messages
+  services and matching service type. Self-handles auto-detected from chat.db.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+CHAT_DB = os.path.expanduser("~/Library/Messages/chat.db")
+MAX_LEN = 4000
+
+# Per the no-dashes editorial rule (see CONSENT.md). Override with --keep-dashes.
+DASH_CHARS = ("\u2014", "\u2013", "\u2015")  # em, en, horizontal-bar
+
+
+def scrub_dashes(text: str) -> tuple[str, int]:
+    """Replace em/en/horizontal-bar dashes (and `--`) with `, `, eating
+    surrounding whitespace so the result reads cleanly."""
+    n = sum(text.count(ch) for ch in DASH_CHARS) + len(re.findall(r"\s*--\s*", text))
+    out = re.sub(r"\s*[\u2014\u2013\u2015]\s*", ", ", text)
+    out = re.sub(r"\s*--\s*", ", ", out)
+    out = re.sub(r",\s*,", ",", out)
+    return out, n
+
+
+def detect_self_handles() -> list[str]:
+    """Read chat.db to find the current user's own iMessage / SMS handles
+    (account_login + destination_caller_id columns on outgoing messages)."""
+    if not os.path.exists(CHAT_DB):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
+    except sqlite3.DatabaseError:
+        return []
+    handles: list[str] = []
+    seen: set[str] = set()
+    for col in ("destination_caller_id", "account"):
+        try:
+            for (val,) in con.execute(
+                f"SELECT DISTINCT {col} FROM message "
+                "WHERE is_from_me=1 AND " f"{col} IS NOT NULL AND " f"{col} != ''"
+            ):
+                # 'account' rows look like "E:address" or "P:phone"; strip the prefix
+                v = val.split(":", 1)[1] if ":" in val and val[1:2] == ":" else val
+                v = v.strip()
+                # RCS service rows prefix phone numbers with 'tel:'; strip it.
+                if v.startswith("tel:"):
+                    v = v[4:]
+                if v and v not in seen:
+                    seen.add(v)
+                    handles.append(v)
+        except sqlite3.DatabaseError:
+            continue
+    con.close()
+    return handles
+
+
+def list_services() -> list[dict]:
+    """Enumerate Messages services. Some macOS versions reject `name of`,
+    so we ask per-service and skip ones that error."""
+    src = """
+    tell application "Messages"
+      set out to ""
+      repeat with s in services
+        try
+          set out to out & (id of s) & "|" & (service type of s as text) & linefeed
+        end try
+      end repeat
+      return out
+    end tell
+    """
+    proc = subprocess.run(
+        ["osascript", "-e", src], capture_output=True, text=True, timeout=15
+    )
+    if proc.returncode != 0:
+        sys.exit(f"osascript error: {proc.stderr.strip()}")
+    services = []
+    for line in proc.stdout.splitlines():
+        if "|" in line:
+            sid, stype = line.split("|", 1)
+            services.append({"id": sid.strip(), "type": stype.strip()})
+    return services
+
+
+def find_service_id(stype: str) -> str:
+    services = list_services()
+    matches = [s for s in services if s["type"].lower() == stype.lower()]
+    if not matches:
+        sys.exit(
+            f"No Messages service of type {stype!r} found. "
+            f"Available: {[s['type'] for s in services]}"
+        )
+    return matches[0]["id"]
+
+
+def applescript_send_participant(handle: str, service_id: str, text: str) -> str:
+    h = handle.replace('"', '\\"')
+    t = text.replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        f'tell application "Messages"\n'
+        f'  set svc to service id "{service_id}"\n'
+        f'  set p to participant "{h}" of svc\n'
+        f'  send "{t}" to p\n'
+        f'end tell\n'
+    )
+
+
+def applescript_send_chat(chat_guid: str, text: str) -> str:
+    g = chat_guid.replace('"', '\\"')
+    t = text.replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        f'tell application "Messages"\n'
+        f'  send "{t}" to chat id "{g}"\n'
+        f'end tell\n'
+    )
+
+
+def has_existing_chat(handle: str, service_name: str) -> bool:
+    if not os.path.exists(CHAT_DB):
+        return False
+    try:
+        con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
+        row = con.execute(
+            "SELECT 1 FROM chat WHERE chat_identifier=? AND service_name=? LIMIT 1",
+            (handle, service_name),
+        ).fetchone()
+        return row is not None
+    except sqlite3.DatabaseError:
+        return False
+
+
+def run_applescript(script: str) -> tuple[int, str, str]:
+    proc = subprocess.run(
+        ["osascript", "-e", script], capture_output=True, text=True, timeout=30
+    )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def consent_banner(recipient: str, text: str) -> None:
+    """Loud reminder printed immediately before any actual send."""
+    print("=" * 72, file=sys.stderr)
+    print("  CONSENT-GATED SEND  (this is a real outbound message)", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print(f"  to  : {recipient}", file=sys.stderr)
+    preview = text.replace("\n", " | ")
+    print(f"  body: {preview[:120]}{'...' if len(preview) > 120 else ''}", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--to", help="Recipient handle (phone or email)")
+    p.add_argument("--chat-id", help="Existing chat GUID (alternative to --to)")
+    p.add_argument("--self", action="store_true",
+                   help="Shortcut: send to your own iMessage address (auto-detected)")
+    p.add_argument("--service", default="iMessage",
+                   choices=["iMessage", "SMS", "RCS"],
+                   help="Messages service to use (default iMessage)")
+    p.add_argument("--yes", action="store_true",
+                   help="Actually send. Without this, prints dry-run AppleScript.")
+    p.add_argument("--keep-dashes", action="store_true",
+                   help="Skip the auto-scrub of em/en dashes (default scrubs them).")
+    p.add_argument("--list-services", action="store_true",
+                   help="List Messages services and exit")
+    p.add_argument("--list-self", action="store_true",
+                   help="Print auto-detected self-handles (own iMessage/SMS addresses)")
+    p.add_argument("text", nargs="*", help="Message body (joined with spaces)")
+    args = p.parse_args()
+
+    if args.list_services:
+        for s in list_services():
+            print(f"  {s['type']:<10}  id={s['id']}")
+        return
+    if args.list_self:
+        for h in detect_self_handles():
+            print(h)
+        return
+
+    text = " ".join(args.text).strip()
+    if not text:
+        sys.exit("error: empty message text")
+    if len(text) > MAX_LEN:
+        sys.exit(f"error: message too long ({len(text)} > {MAX_LEN} chars)")
+
+    if not args.keep_dashes:
+        cleaned, n = scrub_dashes(text)
+        if n:
+            print(
+                f"note: scrubbed {n} dash char(s) per no-dashes rule. "
+                "Pass --keep-dashes to override.",
+                file=sys.stderr,
+            )
+            text = cleaned
+
+    if args.chat_id:
+        script = applescript_send_chat(args.chat_id, text)
+        recipient = f"chat {args.chat_id}"
+    else:
+        if args.self:
+            self_handles = detect_self_handles()
+            if not self_handles:
+                sys.exit(
+                    "error: --self requested but no own iMessage handles detected "
+                    "in chat.db. Use --to <your-own-address> instead."
+                )
+            handle = self_handles[0]
+        elif args.to:
+            handle = args.to
+        else:
+            sys.exit("error: pass one of --to <handle>, --chat-id <guid>, or --self")
+
+        if args.service != "iMessage" and not has_existing_chat(handle, args.service):
+            print(
+                f"warning: no prior {args.service} chat with {handle}; "
+                "send may silently fail without a connected iPhone (Continuity)",
+                file=sys.stderr,
+            )
+
+        service_id = find_service_id(args.service)
+        script = applescript_send_participant(handle, service_id, text)
+        recipient = f"{handle} via {args.service}"
+
+    if not args.yes:
+        print("DRY RUN (pass --yes to actually send)")
+        print(f"recipient: {recipient}")
+        print(f"text     : {text!r}")
+        print("AppleScript:")
+        print("  " + script.replace("\n", "\n  "))
+        return
+
+    consent_banner(recipient, text)
+    rc, out, err = run_applescript(script)
+    if rc != 0:
+        sys.exit(f"send failed (rc={rc}): {err}")
+    if out:
+        print(out)
+    print("sent.")
+
+
+if __name__ == "__main__":
+    main()

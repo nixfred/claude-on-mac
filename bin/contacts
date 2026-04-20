@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""
+contacts: read-only Apple Contacts query tool
+
+Reads ~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb
+(per-account SQLite stores). Each iCloud / CardDAV account gets its own source
+folder. Rows from all sources are merged.
+
+Subcommands:
+  list [N], N most-recently-modified contacts (default 50)
+  find <query> [N], substring search across name/org/phone/email
+  lookup <phone-or-email>, resolve to a contact (best-effort match);
+                                exit 0 + name on stdout, exit 1 if no match
+  dump [--json], full dump of every contact
+  sources, list configured Contacts sources
+
+Phone-number matching strips all non-digits and matches by suffix
+(last 10 digits) so US numbers stored as `+14045551212`, `(404) 555-1212`,
+`404-555-1212`, and `4045551212` all match each other.
+
+Examples:
+  contacts find alice
+  contacts lookup +15555550100
+  contacts lookup someone@example.com
+  contacts list 10 --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from glob import glob
+from typing import Iterable
+
+ADDRESSBOOK_DIR = os.path.expanduser(
+    "~/Library/Application Support/AddressBook"
+)
+APPLE_EPOCH = 978307200  # 2001-01-01 UTC
+
+
+def source_dbs() -> list[str]:
+    """All AddressBook-v22.abcddb files (one per source/account)."""
+    paths = sorted(
+        glob(os.path.join(ADDRESSBOOK_DIR, "Sources", "*", "AddressBook-v22.abcddb"))
+    )
+    # Also include the root db if non-trivial
+    root = os.path.join(ADDRESSBOOK_DIR, "AddressBook-v22.abcddb")
+    if os.path.exists(root):
+        paths.append(root)
+    return paths
+
+
+def open_db(path: str) -> sqlite3.Connection:
+    # mode=ro WITHOUT immutable=1 so we still see WAL writes
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def normalize_phone(s: str) -> str:
+    """Reduce to digits-only suffix (last 10) for fuzzy matching.
+    Preserves country codes longer than 10 digits via a separate full form."""
+    digits = re.sub(r"\D", "", s or "")
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def normalize_email(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def fetch_contacts(con: sqlite3.Connection) -> list[dict]:
+    """Pull all contacts from one source DB, with phones + emails aggregated."""
+    rows = con.execute(
+        """
+        SELECT r.Z_PK            AS pk,
+               r.ZFIRSTNAME      AS first,
+               r.ZLASTNAME       AS last,
+               r.ZNICKNAME       AS nick,
+               r.ZORGANIZATION   AS org,
+               r.ZJOBTITLE       AS title,
+               r.ZMODIFICATIONDATE AS modified
+        FROM ZABCDRECORD r
+        WHERE r.ZFIRSTNAME IS NOT NULL
+           OR r.ZLASTNAME  IS NOT NULL
+           OR r.ZORGANIZATION IS NOT NULL
+        """
+    ).fetchall()
+
+    by_pk: dict[int, dict] = {}
+    for r in rows:
+        name = " ".join(filter(None, [r["first"], r["last"]])).strip() or (
+            r["org"] or r["nick"] or "(unnamed)"
+        )
+        by_pk[r["pk"]] = {
+            "pk": r["pk"],
+            "name": name,
+            "first": r["first"],
+            "last": r["last"],
+            "nick": r["nick"],
+            "org": r["org"],
+            "title": r["title"],
+            "modified": r["modified"],
+            "phones": [],
+            "emails": [],
+        }
+
+    for r in con.execute(
+        "SELECT ZOWNER AS pk, ZFULLNUMBER AS num, ZLABEL AS label FROM ZABCDPHONENUMBER"
+    ):
+        if r["pk"] in by_pk and r["num"]:
+            by_pk[r["pk"]]["phones"].append({"number": r["num"], "label": r["label"]})
+
+    for r in con.execute(
+        "SELECT ZOWNER AS pk, ZADDRESS AS addr, ZLABEL AS label FROM ZABCDEMAILADDRESS"
+    ):
+        if r["pk"] in by_pk and r["addr"]:
+            by_pk[r["pk"]]["emails"].append({"address": r["addr"], "label": r["label"]})
+
+    return list(by_pk.values())
+
+
+def all_contacts() -> list[dict]:
+    """Merged contacts across every source DB. Dedupes on (name, phones)."""
+    seen: dict[tuple, dict] = {}
+    for path in source_dbs():
+        try:
+            with open_db(path) as con:
+                for c in fetch_contacts(con):
+                    key = (
+                        c["name"].lower(),
+                        tuple(sorted(normalize_phone(p["number"]) for p in c["phones"])),
+                    )
+                    # Prefer the more-populated record on collision
+                    existing = seen.get(key)
+                    if not existing or len(c["emails"]) + len(c["phones"]) > len(
+                        existing["emails"]
+                    ) + len(existing["phones"]):
+                        seen[key] = c
+        except sqlite3.DatabaseError as e:
+            print(f"warn: skipping {path}: {e}", file=sys.stderr)
+    return list(seen.values())
+
+
+def build_lookup_index(contacts: Iterable[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Return (phone_index, email_index) for fast handle resolution."""
+    phones: dict[str, dict] = {}
+    emails: dict[str, dict] = {}
+    for c in contacts:
+        for p in c["phones"]:
+            key = normalize_phone(p["number"])
+            if key:
+                phones.setdefault(key, c)
+        for e in c["emails"]:
+            key = normalize_email(e["address"])
+            if key:
+                emails.setdefault(key, c)
+    return phones, emails
+
+
+def render_contact_short(c: dict) -> str:
+    bits = [c["name"]]
+    if c["org"] and c["org"] != c["name"]:
+        bits.append(f"({c['org']})")
+    phones = ", ".join(p["number"] for p in c["phones"][:3])
+    emails = ", ".join(e["address"] for e in c["emails"][:2])
+    line = " ".join(bits)
+    if phones:
+        line += f"  📞 {phones}"
+    if emails:
+        line += f"  ✉ {emails}"
+    return line
+
+
+def cmd_list(args):
+    contacts = all_contacts()
+    contacts.sort(key=lambda c: c["modified"] or 0, reverse=True)
+    contacts = contacts[: args.n]
+    if args.json:
+        print(json.dumps(contacts, indent=2, ensure_ascii=False))
+        return
+    for c in contacts:
+        print(render_contact_short(c))
+
+
+def cmd_find(args):
+    q = args.query.lower()
+    contacts = all_contacts()
+    hits = []
+    for c in contacts:
+        haystack = " ".join(
+            [
+                c["name"] or "",
+                c["org"] or "",
+                c["nick"] or "",
+                c["title"] or "",
+                " ".join(p["number"] for p in c["phones"]),
+                " ".join(e["address"] for e in c["emails"]),
+            ]
+        ).lower()
+        if q in haystack:
+            hits.append(c)
+    hits = hits[: args.n]
+    if args.json:
+        print(json.dumps(hits, indent=2, ensure_ascii=False))
+        return
+    if not hits:
+        print(f"(no contact matches {args.query!r})", file=sys.stderr)
+        sys.exit(1)
+    for c in hits:
+        print(render_contact_short(c))
+
+
+def cmd_lookup(args):
+    contacts = all_contacts()
+    phones, emails = build_lookup_index(contacts)
+    needle = args.handle.strip()
+    hit = None
+    if "@" in needle:
+        hit = emails.get(normalize_email(needle))
+    else:
+        hit = phones.get(normalize_phone(needle))
+    if not hit:
+        print(f"(no contact for {needle})", file=sys.stderr)
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(hit, indent=2, ensure_ascii=False))
+    else:
+        print(hit["name"])
+
+
+def cmd_dump(args):
+    contacts = all_contacts()
+    if args.json:
+        print(json.dumps(contacts, indent=2, ensure_ascii=False))
+        return
+    for c in contacts:
+        print(render_contact_short(c))
+
+
+def cmd_sources(args):
+    paths = source_dbs()
+    if args.json:
+        rows = []
+        for p in paths:
+            try:
+                with open_db(p) as con:
+                    n = con.execute("SELECT COUNT(*) FROM ZABCDRECORD").fetchone()[0]
+                rows.append({"path": p, "records": n, "size": os.path.getsize(p)})
+            except sqlite3.DatabaseError:
+                rows.append({"path": p, "error": "open failed"})
+        print(json.dumps(rows, indent=2))
+        return
+    for p in paths:
+        try:
+            with open_db(p) as con:
+                n = con.execute("SELECT COUNT(*) FROM ZABCDRECORD").fetchone()[0]
+            print(f"{n:>6} records  {os.path.getsize(p):>12} bytes  {p}")
+        except sqlite3.DatabaseError as e:
+            print(f"  ERROR ({e})  {p}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="contacts",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("list");    s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_list)
+    s = sub.add_parser("find");    s.add_argument("query"); s.add_argument("n", nargs="?", type=int, default=20); s.set_defaults(func=cmd_find)
+    s = sub.add_parser("lookup");  s.add_argument("handle"); s.set_defaults(func=cmd_lookup)
+    s = sub.add_parser("dump");    s.set_defaults(func=cmd_dump)
+    s = sub.add_parser("sources"); s.set_defaults(func=cmd_sources)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

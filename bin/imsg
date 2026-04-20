@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""
+imsg: read-only iMessage / SMS query tool
+
+Reads ~/Library/Messages/chat.db using sqlite3 in read-only mode and decodes
+the typedstream-encoded `attributedBody` BLOB used by macOS Ventura+ for
+message text.
+
+Subcommands:
+  recent [N], last N messages across all chats (default 20)
+  from <handle> [N], messages exchanged with one handle (phone/email)
+                                  matches by substring against handle.id
+  search <text> [N], full-text-ish LIKE search across messages
+  thread <handle> [N], same as `from`, oldest→newest
+  contacts, list known handles with message counts
+  chats, list chats (group + 1:1) with last activity
+
+All output is `ts | who | text` (or JSON with --json).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import struct
+import sys
+from glob import glob
+
+DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
+APPLE_EPOCH = 978307200  # 2001-01-01 UTC
+
+# ---------- Contacts name resolution (built-in, no external deps) ----------
+
+_AB_GLOB = os.path.expanduser(
+    "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
+)
+
+
+def _normalize_phone(s: str) -> str:
+    digits = re.sub(r"\D", "", s or "")
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+_NAME_INDEX: dict[str, str] | None = None
+
+
+def name_for(handle: str | None) -> str | None:
+    """Resolve a Messages handle (phone or email) to a Contacts display name.
+    Lazily builds an in-memory index from all AddressBook source DBs on first
+    call. Returns None if no contact match."""
+    global _NAME_INDEX
+    if not handle:
+        return None
+    if _NAME_INDEX is None:
+        idx: dict[str, str] = {}
+        for path in glob(_AB_GLOB):
+            try:
+                con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                con.row_factory = sqlite3.Row
+                names = {
+                    r["pk"]: " ".join(filter(None, [r["first"], r["last"]])).strip()
+                    or r["org"] or r["nick"] or ""
+                    for r in con.execute(
+                        "SELECT Z_PK AS pk, ZFIRSTNAME AS first, ZLASTNAME AS last, "
+                        "ZORGANIZATION AS org, ZNICKNAME AS nick FROM ZABCDRECORD"
+                    )
+                }
+                for r in con.execute(
+                    "SELECT ZOWNER AS pk, ZFULLNUMBER AS num FROM ZABCDPHONENUMBER"
+                ):
+                    name = names.get(r["pk"])
+                    key = _normalize_phone(r["num"] or "")
+                    if name and key:
+                        idx.setdefault(key, name)
+                for r in con.execute(
+                    "SELECT ZOWNER AS pk, ZADDRESS AS addr FROM ZABCDEMAILADDRESS"
+                ):
+                    name = names.get(r["pk"])
+                    addr = (r["addr"] or "").strip().lower()
+                    if name and addr:
+                        idx.setdefault(addr, name)
+                con.close()
+            except sqlite3.DatabaseError:
+                continue
+        _NAME_INDEX = idx
+    if "@" in handle:
+        return _NAME_INDEX.get(handle.strip().lower())
+    return _NAME_INDEX.get(_normalize_phone(handle))
+
+
+def label(handle: str | None, is_from_me: int, with_names: bool) -> str:
+    """Pretty label for the 'who' column."""
+    if is_from_me:
+        return "me"
+    if not handle:
+        return "?"
+    if with_names:
+        n = name_for(handle)
+        if n:
+            return f"{n} <{handle}>"
+    return handle
+
+
+def open_db() -> sqlite3.Connection:
+    if not os.path.exists(DB_PATH):
+        sys.exit(f"chat.db not found at {DB_PATH}")
+    # mode=ro alone (without immutable=1) so we still see uncommitted WAL writes
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def decode_attributed_body(blob: bytes | None) -> str | None:
+    """Pull text from the NSAttributedString typedstream blob.
+    Layout after class chain: \\x84\\x01+ <length> <utf-8 bytes>.
+    Length: 1 byte, or 0x81 + u16 LE, or 0x82 + u32 LE."""
+    if not blob:
+        return None
+    i = blob.find(b"NSString")
+    if i == -1:
+        return None
+    marker = blob.find(b"\x84\x01+", i)
+    if marker == -1:
+        return None
+    p = marker + 3
+    if p >= len(blob):
+        return None
+    first = blob[p]
+    if first == 0x81:
+        length = struct.unpack_from("<H", blob, p + 1)[0]
+        p += 3
+    elif first == 0x82:
+        length = struct.unpack_from("<I", blob, p + 1)[0]
+        p += 5
+    else:
+        length = first
+        p += 1
+    return blob[p : p + length].decode("utf-8", errors="replace")
+
+
+def fmt_ts(apple_ns: int | None) -> str:
+    if not apple_ns:
+        return "?"
+    return dt.datetime.fromtimestamp(apple_ns / 1e9 + APPLE_EPOCH).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def message_text(row: sqlite3.Row) -> str:
+    return row["text"] or decode_attributed_body(row["attributedBody"]) or ""
+
+
+def render(rows, as_json: bool, with_names: bool = True) -> None:
+    if as_json:
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "ts": fmt_ts(r["date"]),
+                    "from_me": bool(r["is_from_me"]),
+                    "handle": r["handle"],
+                    "name": name_for(r["handle"]) if with_names else None,
+                    "service": r["service"],
+                    "chat": r["room_name"] or r["chat_identifier"],
+                    "text": message_text(r),
+                }
+            )
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return
+    for r in rows:
+        who = label(r["handle"], r["is_from_me"], with_names)
+        text = message_text(r).replace("\n", " | ")
+        chat = r["room_name"] or r["chat_identifier"] or ""
+        chat_tag = f" [{chat}]" if chat and chat != (r["handle"] or "") else ""
+        print(f"{fmt_ts(r['date'])}  {who:>30}{chat_tag}: {text}")
+
+
+BASE_SELECT = """
+    SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
+           m.service, h.id AS handle, c.chat_identifier, c.room_name
+    FROM message m
+    LEFT JOIN handle h ON h.ROWID = m.handle_id
+    LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+"""
+
+
+def cmd_recent(con, args):
+    rows = con.execute(
+        BASE_SELECT + " ORDER BY m.date DESC LIMIT ?", (args.n,)
+    ).fetchall()
+    render(reversed(rows) if args.chrono else rows, args.json, with_names=not args.no_names)
+
+
+def cmd_from(con, args):
+    rows = con.execute(
+        BASE_SELECT
+        + " WHERE h.id LIKE ? ORDER BY m.date DESC LIMIT ?",
+        (f"%{args.handle}%", args.n),
+    ).fetchall()
+    render(reversed(rows) if args.chrono else rows, args.json, with_names=not args.no_names)
+
+
+def cmd_thread(con, args):
+    rows = con.execute(
+        BASE_SELECT
+        + " WHERE h.id LIKE ? ORDER BY m.date DESC LIMIT ?",
+        (f"%{args.handle}%", args.n),
+    ).fetchall()
+    render(reversed(rows), args.json, with_names=not args.no_names)
+
+
+def cmd_search(con, args):
+    # text column is null for newer messages; also scan attributedBody as bytes
+    rows = con.execute(
+        BASE_SELECT
+        + """
+        WHERE m.text LIKE ?
+           OR (m.attributedBody IS NOT NULL AND instr(m.attributedBody, CAST(? AS BLOB)) > 0)
+        ORDER BY m.date DESC LIMIT ?""",
+        (f"%{args.query}%", args.query, args.n),
+    ).fetchall()
+    render(reversed(rows) if args.chrono else rows, args.json, with_names=not args.no_names)
+
+
+def cmd_contacts(con, args):
+    rows = con.execute(
+        """
+        SELECT h.id AS handle, h.service, COUNT(m.ROWID) AS n,
+               MAX(m.date) AS last_date
+        FROM handle h LEFT JOIN message m ON m.handle_id = h.ROWID
+        GROUP BY h.id, h.service
+        HAVING n > 0
+        ORDER BY last_date DESC
+        LIMIT ?""",
+        (args.n,),
+    ).fetchall()
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {"handle": r["handle"], "service": r["service"],
+                     "messages": r["n"], "last": fmt_ts(r["last_date"])}
+                    for r in rows
+                ],
+                indent=2,
+            )
+        )
+        return
+    for r in rows:
+        nm = name_for(r["handle"]) if not args.no_names else None
+        suffix = f"  ({nm})" if nm else ""
+        print(f"{fmt_ts(r['last_date'])}  {r['n']:>6}  {r['service']:>8}  {r['handle']}{suffix}")
+
+
+def cmd_chats(con, args):
+    rows = con.execute(
+        """
+        SELECT c.ROWID, c.chat_identifier, c.display_name, c.room_name,
+               c.service_name, MAX(m.date) AS last_date,
+               COUNT(m.ROWID) AS n
+        FROM chat c
+        LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+        LEFT JOIN message m ON m.ROWID = cmj.message_id
+        GROUP BY c.ROWID
+        HAVING n > 0
+        ORDER BY last_date DESC
+        LIMIT ?""",
+        (args.n,),
+    ).fetchall()
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": r["chat_identifier"],
+                        "name": r["display_name"] or r["room_name"],
+                        "service": r["service_name"],
+                        "messages": r["n"],
+                        "last": fmt_ts(r["last_date"]),
+                    }
+                    for r in rows
+                ],
+                indent=2,
+            )
+        )
+        return
+    for r in rows:
+        name = r["display_name"] or r["room_name"] or r["chat_identifier"]
+        print(f"{fmt_ts(r['last_date'])}  {r['n']:>5}  {r['service_name']:>8}  {name}")
+
+
+def cmd_analyze(con, args):
+    """Relationship-arc analysis for one handle: lifetime totals, by-month,
+    hour-of-day, initiation balance, late-night ratio, message length.
+    Surface the data; you (the human or the agent) write the narrative."""
+    like = f"%{args.handle}%"
+    APPLE_NS_TO_UNIX = "date/1000000000+978307200"
+
+    totals = con.execute(f"""
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN m.is_from_me=1 THEN 1 ELSE 0 END) AS sent_by_me,
+               SUM(CASE WHEN m.is_from_me=0 THEN 1 ELSE 0 END) AS sent_by_them,
+               date(MIN(m.date)/1000000000+978307200,'unixepoch','localtime') AS earliest,
+               date(MAX(m.date)/1000000000+978307200,'unixepoch','localtime') AS latest
+        FROM message m JOIN handle h ON h.ROWID=m.handle_id
+        WHERE h.id LIKE ?""", (like,)).fetchone()
+    if not totals or totals["total"] == 0:
+        sys.exit(f"no messages found for handle matching {args.handle!r}")
+
+    monthly = con.execute(f"""
+        SELECT strftime('%Y-%m', {APPLE_NS_TO_UNIX}, 'unixepoch','localtime') AS mo,
+               SUM(CASE WHEN m.is_from_me=1 THEN 1 ELSE 0 END) AS me,
+               SUM(CASE WHEN m.is_from_me=0 THEN 1 ELSE 0 END) AS them,
+               COUNT(*) AS total
+        FROM message m JOIN handle h ON h.ROWID=m.handle_id
+        WHERE h.id LIKE ?
+        GROUP BY mo ORDER BY mo""", (like,)).fetchall()
+
+    hourly = con.execute(f"""
+        SELECT strftime('%H', {APPLE_NS_TO_UNIX}, 'unixepoch','localtime') AS hr,
+               SUM(CASE WHEN m.is_from_me=1 THEN 1 ELSE 0 END) AS me,
+               SUM(CASE WHEN m.is_from_me=0 THEN 1 ELSE 0 END) AS them
+        FROM message m JOIN handle h ON h.ROWID=m.handle_id
+        WHERE h.id LIKE ?
+        GROUP BY hr ORDER BY hr""", (like,)).fetchall()
+
+    init = con.execute(f"""
+        WITH daily AS (
+          SELECT date({APPLE_NS_TO_UNIX},'unixepoch','localtime') AS day,
+                 m.is_from_me, m.date
+          FROM message m JOIN handle h ON h.ROWID=m.handle_id
+          WHERE h.id LIKE ?),
+        first_per_day AS (
+          SELECT day, is_from_me,
+                 ROW_NUMBER() OVER (PARTITION BY day ORDER BY date ASC) rn
+          FROM daily)
+        SELECT SUM(CASE WHEN is_from_me=1 THEN 1 ELSE 0 END) AS me_first,
+               SUM(CASE WHEN is_from_me=0 THEN 1 ELSE 0 END) AS them_first,
+               COUNT(*) AS active_days
+        FROM first_per_day WHERE rn=1""", (like,)).fetchone()
+
+    late = con.execute(f"""
+        SELECT COUNT(*) AS n
+        FROM message m JOIN handle h ON h.ROWID=m.handle_id
+        WHERE h.id LIKE ?
+          AND CAST(strftime('%H',{APPLE_NS_TO_UNIX},'unixepoch','localtime') AS INT)
+              IN (22, 23, 0, 1, 2, 3)""", (like,)).fetchone()
+
+    avg_len = con.execute("""
+        SELECT m.is_from_me,
+               AVG(length(COALESCE(m.text,'')) + length(COALESCE(m.attributedBody,''))) AS avg_len
+        FROM message m JOIN handle h ON h.ROWID=m.handle_id
+        WHERE h.id LIKE ?
+        GROUP BY m.is_from_me""", (like,)).fetchall()
+    me_len = next((r["avg_len"] for r in avg_len if r["is_from_me"] == 1), 0)
+    them_len = next((r["avg_len"] for r in avg_len if r["is_from_me"] == 0), 0)
+
+    contact_name = name_for(args.handle) or "(no contact match)"
+
+    if args.json:
+        out = {
+            "handle": args.handle,
+            "contact_name": contact_name,
+            "lifetime": dict(totals),
+            "monthly": [dict(r) for r in monthly],
+            "hourly":  [dict(r) for r in hourly],
+            "initiation": dict(init) if init else {},
+            "late_night_msgs_22_to_03": late["n"] if late else 0,
+            "late_night_pct": round((late["n"] / totals["total"] * 100) if totals["total"] else 0, 1),
+            "avg_msg_len_me":   round(me_len or 0, 1),
+            "avg_msg_len_them": round(them_len or 0, 1),
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    print(f"\n  Handle: {args.handle}   Contact: {contact_name}")
+    print(f"  Lifetime: {totals['total']} msgs   you sent {totals['sent_by_me']}   they sent {totals['sent_by_them']}")
+    print(f"  Date range: {totals['earliest']}  to  {totals['latest']}")
+    if init and init["active_days"]:
+        pct_me   = round(100 * init["me_first"]   / init["active_days"])
+        pct_them = round(100 * init["them_first"] / init["active_days"])
+        print(f"  Initiation (first msg of day): you {init['me_first']} ({pct_me}%)   them {init['them_first']} ({pct_them}%)   over {init['active_days']} active days")
+    if late and totals["total"]:
+        pct = round(100 * late["n"] / totals["total"], 1)
+        print(f"  Late-night (22:00 to 03:00): {late['n']} msgs ({pct}% of all)")
+    print(f"  Avg msg length: you {round(me_len or 0):>4} chars   them {round(them_len or 0):>4} chars")
+
+    print("\n  Monthly cadence:")
+    print(f"  {'month':<8}  {'you':>5}  {'them':>5}  {'total':>5}")
+    for r in monthly:
+        print(f"  {r['mo']:<8}  {r['me']:>5}  {r['them']:>5}  {r['total']:>5}")
+
+    print("\n  Hour-of-day distribution (when you talk):")
+    max_n = max((r["me"] + r["them"]) for r in hourly) or 1
+    for r in hourly:
+        n = r["me"] + r["them"]
+        bar = "█" * int(40 * n / max_n)
+        print(f"  {r['hr']}h  {bar:<40}  {n:>4}  (you {r['me']:>3} / them {r['them']:>3})")
+    print()
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="imsg", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Top-level convenience flags (also added to each subparser via parents=
+    # so they work POST-subcommand, e.g. `imsg from "+1..." 6 --chrono`)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="emit JSON")
+    common.add_argument("--chrono", action="store_true",
+                        help="print oldest to newest instead of newest to oldest")
+    common.add_argument("--no-names", action="store_true",
+                        help="do not resolve handles via Contacts")
+    # also accept on the parent for `imsg --json recent 5` style
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--chrono", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-names", action="store_true", help=argparse.SUPPRESS)
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("recent",   parents=[common]); s.add_argument("n", nargs="?", type=int, default=20); s.set_defaults(func=cmd_recent)
+    s = sub.add_parser("from",     parents=[common]); s.add_argument("handle"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_from)
+    s = sub.add_parser("thread",   parents=[common]); s.add_argument("handle"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_thread)
+    s = sub.add_parser("search",   parents=[common]); s.add_argument("query"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_search)
+    s = sub.add_parser("contacts", parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_contacts)
+    s = sub.add_parser("chats",    parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_chats)
+    s = sub.add_parser("analyze",  parents=[common],
+                       help="relationship arc analysis for one handle")
+    s.add_argument("handle")
+    s.set_defaults(func=cmd_analyze)
+
+    args = p.parse_args()
+    with open_db() as con:
+        args.func(con, args)
+
+
+if __name__ == "__main__":
+    main()
