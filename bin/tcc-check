@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tcc-check: verify Larry's TCC permissions for Apple-app access.
+tcc-check: verify the agent's TCC permissions for Apple-app access.
 
 Tries each access path and reports ✅ / ❌ with the remediation.
 Exits 0 if everything works, non-zero if anything is missing.

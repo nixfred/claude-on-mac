@@ -15,8 +15,8 @@ Subcommands:
   sources, list configured Contacts sources
 
 Phone-number matching strips all non-digits and matches by suffix
-(last 10 digits) so US numbers stored as `+14045551212`, `(404) 555-1212`,
-`404-555-1212`, and `4045551212` all match each other.
+(last 10 digits) so US numbers stored as `+15555550100`, `(555) 555-0100`,
+`555-555-0100`, and `5555550100` all match each other.
 
 Examples:
   contacts find alice

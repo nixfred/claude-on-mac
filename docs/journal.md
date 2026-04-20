@@ -19,7 +19,7 @@ Day One has a programmatic write path:
 
 ### URL scheme (simple)
 ```bash
-open "dayone://post?entry=$(printf 'My great day' | python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read()))')&tags=larry,daily"
+open "dayone://post?entry=$(printf 'My great day' | python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read()))')&tags=agent,daily"
 ```
 
 This opens Day One with the entry pre-filled. Add `&isQuickEntry=true` to bypass the editor and post directly.
@@ -27,7 +27,7 @@ This opens Day One with the entry pre-filled. Add `&isQuickEntry=true` to bypass
 ### Day One CLI (full control)
 Day One ships a `dayone2` CLI:
 ```bash
-dayone2 -j "Personal" --tags larry daily new "Today the agent noticed I texted Alice 3x and Brian once. Reflective day."
+dayone2 -j "Personal" --tags agent daily new "Today the agent noticed I texted Alice 3x and Bob once. Reflective day."
 ```
 
 Install via Day One Mac app preferences → Advanced → "Install Command Line Tools."
