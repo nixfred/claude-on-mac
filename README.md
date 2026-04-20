@@ -14,8 +14,9 @@
 
 ![macOS](https://img.shields.io/badge/macOS-Tahoe%20%7C%20Sequoia%20%7C%20Sonoma-007AFF?style=for-the-badge&logo=apple&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/for-Claude%20Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white)
+![Linux → Mac via SSH](https://img.shields.io/badge/Linux%20%E2%86%92%20Mac-via%20SSH-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ![License: MIT](https://img.shields.io/badge/license-MIT-34C759?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-1.0.0-FF3B30?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.3.0-FF3B30?style=for-the-badge)
 ![Status](https://img.shields.io/badge/status-shipped-32D74B?style=for-the-badge)
 
 <br>
@@ -23,13 +24,16 @@
 **🔒 Read-by-default · ✅ Send-on-explicit-consent · 🚫 Zero auto-batching · 📜 Full audit trail**
 
 <br>
-<sub>Built and battle-tested on macOS Tahoe (26.x). Zero Python dependencies. No daemons. No MCP servers to babysit.</sub>
+<sub>Runs on the Mac natively — or from a Linux / DGX workstation that reaches the Mac over SSH (Tailscale recommended). Zero Python dependencies. No daemons. No MCP servers to babysit.</sub>
 
 </div>
 
 ---
 
 ## ⚡️ The one-paste install
+
+> 🍎 **Claude Code running on the Mac itself?** You're in the right place — keep reading.
+> 🐧 **Claude Code on Linux / DGX / anywhere else, reaching a remote Mac?** Read **[`docs/remote-ssh.md`](./docs/remote-ssh.md)** first. Same toolkit, adds a thin SSH shim layer. Tailscale strongly recommended.
 
 <div align="center">
   <img src="./assets/04-install.png" alt="Install in one paste, magic line for Claude Code" width="720" />
@@ -265,13 +269,7 @@ Add `~/bin` to your `PATH` if it isn't already. Read [`docs/tcc-permissions.md`]
 
 But really, paste the magic line. The whole point is your AI does the install with you, and walks the consent profile with you in plain English.
 
----
-
-## 🐧 Using claude-on-mac from Linux
-
-Primary workstation isn't the Mac? See [`docs/remote-ssh.md`](./docs/remote-ssh.md) for a ~15-minute setup that installs thin SSH shims on your Linux box and forwards each helper over SSH to the Mac. Tailscale is the recommended transport. The nine helpers in `bin/` stay on the Mac unchanged; the shim is one basename-dispatched bash script.
-
-The consent model is transport-agnostic: dry-run is still the default, `--yes` is still required per send, and the `CONSENT-GATED SEND` banner streams through SSH stderr into your Linux terminal.
+On Linux / DGX / any non-Mac host? The parallel path is [`docs/remote-ssh.md`](./docs/remote-ssh.md) — same nine helpers, thin SSH shim on the client side.
 
 ---
 
