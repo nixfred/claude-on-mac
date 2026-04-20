@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+mail: read-only Apple Mail query tool (envelope SQLite + .emlx parser).
+
+Read commands:
+  mail accounts                list configured Mail.app accounts
+  mail inbox [N]               N most-recent envelopes across all accounts
+  mail unread [N]              N most-recent unread envelopes
+  mail search <query> [N]      subject + sender LIKE search
+  mail from <address> [N]      messages from / to that address (substring)
+  mail today                   today's mail
+  mail show <ROWID>            print one message body (rfc822 from .emlx)
+  mail show-id <Message-ID>    print body by RFC822 Message-ID
+  mail domains [N]             top sender domains last 30 days
+  mail --json inbox 5          JSON
+
+For SEND, see `~/bin/mail-send` (consent-gated).
+"""
+from __future__ import annotations
+import argparse, email, glob, json, os, sqlite3, sys
+
+
+def find_envelope_index() -> str:
+    """Mail's Vn directory varies by macOS version (V8/V9/V10/...). Find it."""
+    candidates = sorted(glob.glob(os.path.expanduser("~/Library/Mail/V*/MailData/Envelope Index")))
+    if not candidates:
+        sys.exit("Mail Envelope Index not found (is Apple Mail set up?)")
+    return candidates[-1]
+
+
+def open_db(path: str) -> sqlite3.Connection:
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def base_select():
+    return """
+    SELECT m.ROWID AS rowid,
+           datetime(m.date_received,'unixepoch','localtime') AS received,
+           datetime(m.date_sent,'unixepoch','localtime') AS sent,
+           s.subject AS subject,
+           af.address AS from_addr,
+           m.read AS is_read,
+           m.flagged AS is_flagged,
+           m.deleted AS is_deleted,
+           m.message_id AS rfc822_id,
+           mb.url AS mailbox_url
+    FROM messages m
+    LEFT JOIN subjects   s  ON s.ROWID = m.subject
+    LEFT JOIN addresses  af ON af.ROWID = m.sender
+    LEFT JOIN mailboxes  mb ON mb.ROWID = m.mailbox
+    WHERE m.deleted = 0
+    """
+
+
+def render(rows, as_json: bool):
+    if as_json:
+        print(json.dumps([dict(r) for r in rows], indent=2, ensure_ascii=False)); return
+    if not rows:
+        print("(no messages)"); return
+    for r in rows:
+        flag = "★" if r["is_flagged"] else " "
+        read = " " if r["is_read"] else "•"
+        subj = (r["subject"] or "(no subject)")[:60]
+        sender = (r["from_addr"] or "?")[:34]
+        print(f"  {r['rowid']:>7} {read}{flag}  {r['received']}  {sender:<34}  {subj}")
+
+
+def cmd_inbox(args):
+    db = find_envelope_index()
+    con = open_db(db)
+    rows = con.execute(base_select() + " ORDER BY m.date_received DESC LIMIT ?", (args.n,)).fetchall()
+    render(rows, args.json)
+
+
+def cmd_unread(args):
+    db = find_envelope_index()
+    con = open_db(db)
+    rows = con.execute(base_select() + " AND m.read = 0 ORDER BY m.date_received DESC LIMIT ?", (args.n,)).fetchall()
+    render(rows, args.json)
+
+
+def cmd_search(args):
+    db = find_envelope_index()
+    con = open_db(db)
+    q = f"%{args.query}%"
+    rows = con.execute(
+        base_select() + " AND (s.subject LIKE ? OR af.address LIKE ?) "
+        "ORDER BY m.date_received DESC LIMIT ?", (q, q, args.n)
+    ).fetchall()
+    render(rows, args.json)
+
+
+def cmd_from(args):
+    db = find_envelope_index()
+    con = open_db(db)
+    q = f"%{args.address}%"
+    rows = con.execute(
+        base_select() + " AND af.address LIKE ? ORDER BY m.date_received DESC LIMIT ?",
+        (q, args.n)
+    ).fetchall()
+    render(rows, args.json)
+
+
+def cmd_today(args):
+    db = find_envelope_index()
+    con = open_db(db)
+    rows = con.execute(
+        base_select() +
+        " AND m.date_received > CAST(strftime('%s','now','-24 hour') AS INTEGER)"
+        " ORDER BY m.date_received DESC LIMIT ?", (args.n,)
+    ).fetchall()
+    render(rows, args.json)
+
+
+def cmd_domains(args):
+    db = find_envelope_index()
+    con = open_db(db)
+    rows = con.execute("""
+        SELECT
+          CASE WHEN instr(a.address,'@') > 0
+               THEN substr(a.address, instr(a.address,'@')+1)
+               ELSE a.address END AS domain,
+          COUNT(*) AS n
+        FROM messages m
+        JOIN addresses a ON a.ROWID = m.sender
+        WHERE m.date_received > CAST(strftime('%s','now','-30 day') AS INTEGER)
+        GROUP BY domain ORDER BY n DESC LIMIT ?""", (args.n,)).fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2)); return
+    for r in rows:
+        print(f"  {r['n']:>5}  {r['domain']}")
+
+
+def cmd_accounts(args):
+    """Inferred from mailbox URLs in envelope index."""
+    db = find_envelope_index()
+    con = open_db(db)
+    rows = con.execute("""
+        SELECT DISTINCT
+          CASE
+            WHEN url LIKE '%imap-data://%' THEN 'IMAP'
+            WHEN url LIKE '%pop-data://%'  THEN 'POP'
+            WHEN url LIKE '%ews-data://%'  THEN 'Exchange'
+            WHEN url LIKE '%local-data://%' THEN 'Local'
+            ELSE 'Other'
+          END AS kind,
+          url
+        FROM mailboxes
+        WHERE url IS NOT NULL
+        ORDER BY url""").fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2)); return
+    for r in rows:
+        print(f"  {r['kind']:>10}  {r['url']}")
+
+
+def find_emlx_for_message_id(rfc822_id: str) -> str | None:
+    """Walk all .emlx files for the matching Message-ID. Slow but works."""
+    if not rfc822_id:
+        return None
+    for path in glob.iglob(os.path.expanduser("~/Library/Mail/V*/**/*.emlx"), recursive=True):
+        try:
+            with open(path, "rb") as f:
+                length = int(f.readline().strip())
+                msg = email.message_from_bytes(f.read(length))
+            if msg["Message-ID"] and rfc822_id in msg["Message-ID"]:
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def parse_emlx(path: str) -> str:
+    with open(path, "rb") as f:
+        length = int(f.readline().strip())
+        msg = email.message_from_bytes(f.read(length))
+    out = []
+    out.append(f"From   : {msg.get('From','')}")
+    out.append(f"To     : {msg.get('To','')}")
+    out.append(f"Subject: {msg.get('Subject','')}")
+    out.append(f"Date   : {msg.get('Date','')}")
+    out.append("")
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    out.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+                    break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            out.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
+    return "\n".join(out)
+
+
+def cmd_show(args):
+    """Show body by ROWID. Uses message_id to locate the .emlx."""
+    db = find_envelope_index()
+    con = open_db(db)
+    row = con.execute(
+        "SELECT message_id FROM messages WHERE ROWID = ?", (args.rowid,)
+    ).fetchone()
+    if not row or not row["message_id"]:
+        sys.exit(f"no message with ROWID {args.rowid} (or no Message-ID)")
+    path = find_emlx_for_message_id(row["message_id"])
+    if not path:
+        sys.exit(f"could not locate .emlx for ROWID {args.rowid} "
+                 f"(Message-ID {row['message_id']!r})")
+    print(parse_emlx(path))
+
+
+def cmd_show_id(args):
+    path = find_emlx_for_message_id(args.message_id)
+    if not path:
+        sys.exit(f"could not locate .emlx for Message-ID {args.message_id!r}")
+    print(parse_emlx(path))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("accounts", parents=[common]).set_defaults(func=cmd_accounts)
+    s = sub.add_parser("inbox",  parents=[common]); s.add_argument("n", nargs="?", type=int, default=20); s.set_defaults(func=cmd_inbox)
+    s = sub.add_parser("unread", parents=[common]); s.add_argument("n", nargs="?", type=int, default=20); s.set_defaults(func=cmd_unread)
+    s = sub.add_parser("search", parents=[common]); s.add_argument("query"); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_search)
+    s = sub.add_parser("from",   parents=[common]); s.add_argument("address"); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_from)
+    s = sub.add_parser("today",  parents=[common]); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_today)
+    s = sub.add_parser("domains",parents=[common]); s.add_argument("n", nargs="?", type=int, default=20); s.set_defaults(func=cmd_domains)
+    s = sub.add_parser("show",   parents=[common]); s.add_argument("rowid", type=int); s.set_defaults(func=cmd_show)
+    s = sub.add_parser("show-id",parents=[common]); s.add_argument("message_id"); s.set_defaults(func=cmd_show_id)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+rem: list and manage Apple Reminders via AppleScript.
+
+Read commands:
+  rem lists                       list all Reminders lists with open counts
+  rem open [<list>]               show open reminders (default: all lists)
+  rem due                         show reminders due today + overdue
+  rem find <query>                substring search across all open reminders
+
+Write commands (consent-gated for --yes):
+  rem add "<text>" [--list X] [--due "<when>"] [--yes]
+  rem done <substring>            mark a reminder complete (substring match)
+                                  Pass --yes to actually mark complete.
+  rem --json open                 JSON output
+
+Read-only by default. Writes require --yes per individual call.
+"""
+from __future__ import annotations
+import argparse, json, shutil, subprocess, sys
+
+
+def osascript(src: str, timeout: int = 300) -> str:
+    """Default 300s; Reminders.app via AppleScript is fundamentally slow.
+    Each property read is an AppleEvent round-trip. The 'lists whose name
+    is X' predicate enumerates all lists internally before filtering. Plan
+    for 5+ seconds per reminder with due-date access. CloudKit cold cache
+    multiplies everything."""
+    if not shutil.which("osascript"):
+        sys.exit("osascript not found")
+    proc = subprocess.run(["osascript", "-e", src], capture_output=True,
+                          text=True, timeout=timeout)
+    if proc.returncode != 0:
+        sys.exit(f"AppleScript error: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def list_lists():
+    src = '''
+    tell application "Reminders"
+      set out to ""
+      repeat with l in lists
+        try
+          set openN to (count of (reminders of l whose completed is false))
+          set out to out & (name of l) & "|" & openN & linefeed
+        end try
+      end repeat
+      return out
+    end tell
+    '''
+    rows = []
+    for line in osascript(src).splitlines():
+        if "|" in line:
+            name, n = line.split("|", 1)
+            rows.append({"name": name.strip(), "open": int(n.strip())})
+    return rows
+
+
+def parse_reminder_lines(raw: str) -> list[dict]:
+    rows = []
+    for line in raw.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) >= 3:
+            rows.append({
+                "list":  parts[0].strip(),
+                "name":  parts[1].strip(),
+                "due":   parts[2].strip() if parts[2].strip().lower() != "missing value" else "",
+                "body":  parts[3].strip() if len(parts) >= 4 else "",
+            })
+    return rows
+
+
+def render(rows, as_json: bool):
+    if as_json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False)); return
+    if not rows:
+        print("(no reminders)"); return
+    for r in rows:
+        due = f"  due {r['due']}" if r["due"] else ""
+        print(f"  [{r['list']:>15}]  {r['name']}{due}")
+
+
+def cmd_lists(args):
+    rows = list_lists()
+    if args.json:
+        print(json.dumps(rows, indent=2)); return
+    for r in rows:
+        print(f"  {r['open']:>4} open   {r['name']}")
+
+
+def _open_in(list_name: str | None) -> str:
+    """AppleScript that gathers open reminders into out string.
+
+    When given a single list name, uses `tell list "X"` (direct reference)
+    rather than `lists whose name is "X"` (filter). The direct form is
+    dramatically faster because Reminders skips the per-list CloudKit
+    enumeration. Bulk `name of every reminder` errors out -1728 on modern
+    macOS, so per-reminder iteration is unavoidable."""
+    if list_name:
+        e = list_name.replace('"', '\\"')
+        return f'''
+        tell application "Reminders"
+          set out to ""
+          tell list "{e}"
+            set rs to (reminders whose completed is false)
+            repeat with r in rs
+              try
+                set d to (due date of r) as text
+              on error
+                set d to "missing value"
+              end try
+              set out to out & "{e}" & "|" & (name of r) & "|" & d & linefeed
+            end repeat
+          end tell
+          return out
+        end tell
+        '''
+    return '''
+    tell application "Reminders"
+      set out to ""
+      repeat with l in lists
+        try
+          set rs to (reminders of l whose completed is false)
+          repeat with r in rs
+            try
+              set d to (due date of r) as text
+            on error
+              set d to "missing value"
+            end try
+            set out to out & (name of l) & "|" & (name of r) & "|" & d & linefeed
+          end repeat
+        end try
+      end repeat
+      return out
+    end tell
+    '''
+
+
+def cmd_open(args):
+    rows = parse_reminder_lines(osascript(_open_in(args.list)))
+    rows.sort(key=lambda r: (r["list"], r["name"]))
+    render(rows, args.json)
+
+
+def cmd_due(args):
+    """Today + overdue."""
+    src = '''
+    tell application "Reminders"
+      set out to ""
+      set t0 to (current date) - (time of (current date))
+      set t1 to t0 + 1 * days
+      repeat with l in lists
+        try
+          set rs to (reminders of l whose completed is false and due date is less than t1)
+          repeat with r in rs
+            try
+              set d to (due date of r) as text
+            on error
+              set d to "missing value"
+            end try
+            set out to out & (name of l) & "|" & (name of r) & "|" & d & linefeed
+          end repeat
+        end try
+      end repeat
+      return out
+    end tell
+    '''
+    rows = parse_reminder_lines(osascript(src))
+    render(rows, args.json)
+
+
+def cmd_find(args):
+    rows = parse_reminder_lines(osascript(_open_in(None)))
+    q = args.query.lower()
+    hits = [r for r in rows if q in r["name"].lower()]
+    render(hits, args.json)
+
+
+def cmd_add(args):
+    list_e = (args.list or "Reminders").replace('"', '\\"')
+    name_e = args.text.replace('"', '\\"')
+    props = f'name:"{name_e}"'
+    if args.due:
+        due_e = args.due.replace('"', '\\"')
+        props += f', due date:date "{due_e}"'
+    script = f'''
+    tell application "Reminders"
+      tell list "{list_e}"
+        make new reminder with properties {{{props}}}
+      end tell
+    end tell
+    '''
+    if not args.yes:
+        print("DRY RUN (pass --yes to actually create)")
+        print(f"  list: {list_e}")
+        print(f"  name: {args.text!r}")
+        if args.due: print(f"  due : {args.due}")
+        print("AppleScript:")
+        for line in script.splitlines(): print(f"  {line}")
+        return
+    osascript(script)
+    print("created.")
+
+
+def cmd_done(args):
+    """Mark reminder complete (substring match)."""
+    name_e = args.query.replace('"', '\\"')
+    script = f'''
+    tell application "Reminders"
+      set found to {{}}
+      repeat with l in lists
+        try
+          set rs to (reminders of l whose completed is false and name contains "{name_e}")
+          set found to found & rs
+        end try
+      end repeat
+      if (count of found) = 0 then error "no matching open reminder"
+      set targetR to item 1 of found
+      set out to (name of targetR) & " (in " & (name of container of targetR) & ")"
+      if {str(args.yes).lower()} then
+        set completed of targetR to true
+        return "done: " & out
+      else
+        return "would complete: " & out
+      end if
+    end tell
+    '''
+    print(osascript(script))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("lists", parents=[common]).set_defaults(func=cmd_lists)
+    s = sub.add_parser("open", parents=[common])
+    s.add_argument("list", nargs="?")
+    s.set_defaults(func=cmd_open)
+    sub.add_parser("due",   parents=[common]).set_defaults(func=cmd_due)
+    s = sub.add_parser("find", parents=[common])
+    s.add_argument("query")
+    s.set_defaults(func=cmd_find)
+    s = sub.add_parser("add", parents=[common])
+    s.add_argument("text")
+    s.add_argument("--list", default=None)
+    s.add_argument("--due",  default=None, help='AppleScript date string')
+    s.add_argument("--yes",  action="store_true")
+    s.set_defaults(func=cmd_add)
+    s = sub.add_parser("done", parents=[common])
+    s.add_argument("query", help="substring of reminder name to complete")
+    s.add_argument("--yes",  action="store_true")
+    s.set_defaults(func=cmd_done)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

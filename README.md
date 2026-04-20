@@ -115,12 +115,15 @@ mail-send compose --from gmail \
 <td align="center" valign="top">
 
 ### 📅 Calendar
-**Read** events. **Create** events.<br>
-EventKit-grade, AppleScript path documented.
+**Read** events. **Create** events with per-message consent.
 
 ```bash
-osascript -e 'tell application "Calendar" \
-  to get name of every calendar'
+cal calendars
+cal week
+cal find "doctor"
+cal add "Dentist" \
+  --at "Friday 2pm" \
+  --calendar "Personal" --yes
 ```
 
 </td>
@@ -131,20 +134,27 @@ osascript -e 'tell application "Calendar" \
 across every list and account.
 
 ```bash
-osascript -e 'tell application "Reminders" \
-  to get name of every list'
+rem lists
+rem due
+rem add "Pick up dry cleaning" \
+  --due "tomorrow 5pm" --yes
+rem done "dry cleaning" --yes
 ```
 
 </td>
 <td align="center" valign="top">
 
 ### 📝 Notes
-**List** titles. **Create** notes.<br>
-**Append** to daily notes. (Body via AppleScript, never SQLite.)
+**List** titles. **Show** bodies. **Create** and<br>
+**append** notes (via AppleScript, never SQLite).
 
 ```bash
-osascript -e 'tell application "Notes" \
-  to get name of every folder'
+note list 20
+note find "daily"
+note new "Daily 2026-04-20" \
+  --folder "Personal" --yes
+note append "Daily 2026-04-20" \
+  --body "<p>more</p>" --yes
 ```
 
 </td>

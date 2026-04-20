@@ -62,14 +62,24 @@ For each helper, only create the symlink if the user said yes to its capability:
 ```bash
 mkdir -p ~/bin
 
-# Read-only helpers (default install):
-ln -sf ~/claude-on-mac/bin/imsg     ~/bin/imsg
-ln -sf ~/claude-on-mac/bin/contacts ~/bin/contacts
-ln -sf ~/claude-on-mac/bin/tcc-check ~/bin/tcc-check
+# Read-only helpers (default install if user said yes to that capability):
+ln -sf ~/claude-on-mac/bin/imsg      ~/bin/imsg       # Messages read
+ln -sf ~/claude-on-mac/bin/contacts  ~/bin/contacts   # Contacts read
+ln -sf ~/claude-on-mac/bin/cal       ~/bin/cal        # Calendar list/find
+ln -sf ~/claude-on-mac/bin/rem       ~/bin/rem        # Reminders list/find
+ln -sf ~/claude-on-mac/bin/note      ~/bin/note       # Notes list/find/show
+ln -sf ~/claude-on-mac/bin/mail      ~/bin/mail       # Mail read
+ln -sf ~/claude-on-mac/bin/tcc-check ~/bin/tcc-check  # always install (verifier)
 
 # SEND helpers (only if the user explicitly said yes in step 1):
 ln -sf ~/claude-on-mac/bin/imsg-send ~/bin/imsg-send   # only if they want iMessage send
 ln -sf ~/claude-on-mac/bin/mail-send ~/bin/mail-send   # only if they want Mail send
+
+# Calendar/Reminders/Notes WRITE is bundled into cal/rem/note above; the
+# `add` / `new` / `append` subcommands still default to dry-run and require
+# --yes per individual call. If the user opted out of writes for one of
+# these apps, you do NOT need to skip the symlink; just verbally tell
+# them you will not invoke the write subcommands.
 ```
 
 If the user opted out of, say, iMessage sending, do NOT symlink `imsg-send`. Tell them: "I'm not installing imsg-send because you opted out. If you change your mind later, I can add it."
@@ -98,23 +108,30 @@ For each enabled capability, run a tiny command and show the user the output:
 | Capability | Smoke test |
 |------------|-----------|
 | Messages read | `imsg recent 3` |
-| Contacts | `contacts find <user-suggested-name>` |
-| Mail accounts | `mail-send accounts` |
-| iMessage send (if enabled) | `imsg-send --self "claude install proof of life"` (DRY RUN only — show the AppleScript, do NOT pass --yes without explicit authorization) |
-| Mail send (if enabled) | `mail-send compose --from <user-account-substring> --to <user's-other-address> --subject "claude install proof of life" --body "proof"` (DRY RUN only) |
+| Contacts | `contacts find <a-name-the-user-suggests>` |
+| Calendar | `cal calendars` then `cal week` |
+| Reminders | `rem lists` (note: Reminders.app via AppleScript is slow, 30s+ is normal) |
+| Notes | `note folders` then `note list 5` |
+| Mail read | `mail accounts` then `mail inbox 5` |
+| iMessage send (if enabled) | `imsg-send --self "claude install proof of life"` (DRY RUN only) |
+| Mail send (if enabled) | `mail-send compose --from <hint> --to <user's-other-address> --subject "claude install proof of life" --body "proof"` (DRY RUN only) |
 
 For the send smoke tests, ASK the user: "Want me to actually send the proof-of-life from this dry run? It'll go to your own address." Only run with `--yes` if they say yes.
 
-### Step 6: Save what you learned to memory
+### Step 6: Build user-context memory
 
-Create a memory entry (or equivalent persistent note) named `claude_on_mac_install` with:
+Now run the protocol in `docs/memory-init.md`. That file walks you through:
 
-- Date installed
-- User's opt-in / opt-out choices (which apps, send vs read)
-- The `--from` aliases the user prefers for Mail (e.g., "user prefers `gmail` shorthand to mean their Google account")
-- TCC quirks specific to this Mac (e.g., "FDA was already granted, AppleScript prompts auto-approved")
+- Discovering the user's top conversation partners (`imsg contacts 20`, `mail domains 15`)
+- Asking the user to classify those contacts (spouse / family / friend / work / service)
+- Capturing editorial preferences (drafting style, words to avoid)
+- Capturing account routing preferences (which Mail account is personal vs work)
+- Capturing default destinations (which Notes folder is the daily journal, which Reminders list is for work, etc.)
+- Capturing do-not-touch zones (folders / contacts / calendars to skip)
 
-Also save a memory entry titled `consent_rule_imessage_mail` reinforcing: NEVER send without explicit per-send authorization. This rule survives auto modes and pre-discussed plans.
+Save the answers as separate memory entries. Do NOT skip this step. Without it, every future session starts from zero context and the agent feels generic.
+
+ALSO save a memory entry titled `consent_rule_imessage_mail` reinforcing the hard rule from `CONSENT.md`: NEVER send without explicit per-send authorization. This rule survives auto modes and pre-discussed plans.
 
 ### Step 7: Confirm and stand down
 
@@ -135,10 +152,15 @@ DO NOT proactively send anything, read anything, or make recommendations. Wait f
 
 ## Recommended reading after the install
 
-- `docs/strategy.md` — when to use each mechanism.
-- `docs/messages.md` — fully worked example. Other apps follow the same shape.
-- `docs/sqlite-wal-gotcha.md` — five-minute read that prevents a class of bugs.
-- `docs/prior-art.md` — what's out there if you want to graft features.
+In this order:
+
+1. **`docs/agent-workflows.md`** — how to actually USE the toolkit. The synthesis patterns for "how am I doing", relationship analysis, inbox triage, send protocol. THIS IS THE FILE THAT TURNS DATA INTO USEFUL HELP. Read it once and refer back when the user makes a high-level ask.
+2. **`docs/memory-init.md`** — already covered in Step 6. Re-read when the user adds a new account or relationship.
+3. **`docs/strategy.md`** — when to use each mechanism (SQLite vs AppleScript vs EventKit vs Shortcuts).
+4. **`docs/cookbook.md`** — copy-pasteable SQL recipes for ad-hoc queries.
+5. **`docs/messages.md`** — fully worked example. Other per-app docs follow the same shape.
+6. **`docs/sqlite-wal-gotcha.md`** — five-minute read that prevents a class of bugs.
+7. **`docs/prior-art.md`** — other OSS projects in this space (some great, some archived).
 
 ## Failure modes to watch for
 

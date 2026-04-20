@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""
+cal: list and add Apple Calendar events via AppleScript.
+
+Read commands:
+  cal calendars                    list all calendars (name + writable status)
+  cal today                        events today
+  cal tomorrow                     events tomorrow
+  cal week                         events next 7 days
+  cal month                        events next 30 days
+  cal range <YYYY-MM-DD> <days>    events from date for N days
+  cal find <query>                 search summaries the next 60 days
+
+Write commands (consent-gated):
+  cal add "<title>" --at "<when>" [--duration <mins>] [--calendar <name>] [--yes]
+       <when> is anything AppleScript date parses, e.g. "tomorrow 3pm",
+       "Friday 10am", "Apr 22 14:00".
+       Default --calendar is the first writable non-subscription calendar.
+
+  cal --json today                 JSON output
+
+Read-only by default. Writes require --yes per individual call (consent.md).
+"""
+from __future__ import annotations
+import argparse, json, shutil, subprocess, sys
+
+
+def osascript(src: str, timeout: int = 120) -> str:
+    """Default 120s; Calendar.app enumerating all-events-in-range is slow on
+    accounts with many calendars (especially Birthdays + subscribed feeds)."""
+    if not shutil.which("osascript"):
+        sys.exit("osascript not found")
+    proc = subprocess.run(["osascript", "-e", src], capture_output=True,
+                          text=True, timeout=timeout)
+    if proc.returncode != 0:
+        sys.exit(f"AppleScript error: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def list_calendars():
+    src = '''
+    tell application "Calendar"
+      set out to ""
+      repeat with c in calendars
+        try
+          set out to out & (name of c) & "|" & (writable of c as text) & linefeed
+        end try
+      end repeat
+      return out
+    end tell
+    '''
+    rows = []
+    for line in osascript(src).splitlines():
+        if "|" in line:
+            name, w = line.split("|", 1)
+            rows.append({"name": name.strip(), "writable": w.strip().lower() == "true"})
+    return rows
+
+
+def applescript_range(t0_expr: str, t1_expr: str) -> str:
+    """Returns AppleScript that lists events in [t0, t1)."""
+    return f'''
+    tell application "Calendar"
+      set t0 to {t0_expr}
+      set t1 to {t1_expr}
+      set out to ""
+      repeat with c in calendars
+        try
+          set evs to (every event of c whose start date >= t0 and start date < t1)
+          repeat with e in evs
+            set evStart to start date of e
+            set evEnd to end date of e
+            set evSummary to summary of e
+            try
+              set evLoc to location of e
+            on error
+              set evLoc to ""
+            end try
+            set out to out & (evStart as text) & "|" & (evEnd as text) & "|" & (name of c) & "|" & evSummary & "|" & evLoc & linefeed
+          end repeat
+        end try
+      end repeat
+      return out
+    end tell
+    '''
+
+
+def parse_event_lines(raw: str) -> list[dict]:
+    rows = []
+    for line in raw.splitlines():
+        parts = line.split("|", 4)
+        if len(parts) >= 4:
+            rows.append({
+                "start": parts[0].strip(),
+                "end":   parts[1].strip(),
+                "calendar": parts[2].strip(),
+                "summary":  parts[3].strip(),
+                "location": parts[4].strip() if len(parts) >= 5 else "",
+            })
+    rows.sort(key=lambda r: r["start"])
+    return rows
+
+
+def render_events(rows, as_json: bool):
+    if as_json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    if not rows:
+        print("(no events in range)")
+        return
+    for r in rows:
+        loc = f"  @ {r['location']}" if r["location"] else ""
+        print(f"  {r['start']:<32} [{r['calendar']:>20}]  {r['summary']}{loc}")
+
+
+# ---------- read commands ----------
+
+def cmd_calendars(args):
+    cals = list_calendars()
+    if args.json:
+        print(json.dumps(cals, indent=2)); return
+    for c in cals:
+        flag = "rw" if c["writable"] else "ro"
+        print(f"  {flag}  {c['name']}")
+
+
+def _today_range(days: int) -> tuple[str, str]:
+    return ("(current date) - (time of (current date))",
+            f"((current date) - (time of (current date))) + {days} * days")
+
+
+def cmd_today(args):
+    t0, t1 = _today_range(1)
+    render_events(parse_event_lines(osascript(applescript_range(t0, t1))), args.json)
+
+
+def cmd_tomorrow(args):
+    t0 = "((current date) - (time of (current date))) + 1 * days"
+    t1 = "((current date) - (time of (current date))) + 2 * days"
+    render_events(parse_event_lines(osascript(applescript_range(t0, t1))), args.json)
+
+
+def cmd_week(args):
+    t0, t1 = _today_range(7)
+    render_events(parse_event_lines(osascript(applescript_range(t0, t1))), args.json)
+
+
+def cmd_month(args):
+    t0, t1 = _today_range(30)
+    render_events(parse_event_lines(osascript(applescript_range(t0, t1))), args.json)
+
+
+def cmd_range(args):
+    t0 = f'date "{args.date}"'
+    t1 = f'(date "{args.date}") + {args.days} * days'
+    render_events(parse_event_lines(osascript(applescript_range(t0, t1))), args.json)
+
+
+def cmd_find(args):
+    t0, t1 = _today_range(60)
+    rows = parse_event_lines(osascript(applescript_range(t0, t1)))
+    q = args.query.lower()
+    hits = [r for r in rows if q in r["summary"].lower() or q in r["location"].lower()]
+    render_events(hits, args.json)
+
+
+# ---------- write command ----------
+
+def cmd_add(args):
+    if not args.title:
+        sys.exit("error: title required")
+    if not args.at:
+        sys.exit("error: --at <when> required")
+
+    cal_name = args.calendar
+    if not cal_name:
+        sys.exit(
+            "error: --calendar <name> is required (no safe default).\n"
+            "Run `cal calendars` to see your options. We don't auto-pick "
+            "because Calendar.app's first writable calendar is often a stale "
+            "or admin one."
+        )
+
+    duration = args.duration
+    title = args.title.replace("\\","\\\\").replace('"','\\"')
+    when  = args.at.replace("\\","\\\\").replace('"','\\"')
+    cal_e = cal_name.replace("\\","\\\\").replace('"','\\"')
+
+    script = f'''
+    tell application "Calendar"
+      tell calendar "{cal_e}"
+        set startDt to date "{when}"
+        set endDt to startDt + {duration} * minutes
+        make new event with properties {{summary:"{title}", start date:startDt, end date:endDt}}
+      end tell
+    end tell
+    '''
+
+    if not args.yes:
+        print("DRY RUN (pass --yes to actually create)")
+        print(f"  calendar: {cal_name}")
+        print(f"  title   : {title!r}")
+        print(f"  start   : {when}")
+        print(f"  duration: {duration} min")
+        print("AppleScript:")
+        for line in script.splitlines():
+            print(f"  {line}")
+        return
+
+    print("=" * 60, file=sys.stderr)
+    print("  CONSENT-GATED CALENDAR WRITE", file=sys.stderr)
+    print(f"  calendar: {cal_name}", file=sys.stderr)
+    print(f"  title   : {title!r}  at {when}  ({duration} min)", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    osascript(script)
+    print("created.")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("calendars", parents=[common]).set_defaults(func=cmd_calendars)
+    sub.add_parser("today",     parents=[common]).set_defaults(func=cmd_today)
+    sub.add_parser("tomorrow",  parents=[common]).set_defaults(func=cmd_tomorrow)
+    sub.add_parser("week",      parents=[common]).set_defaults(func=cmd_week)
+    sub.add_parser("month",     parents=[common]).set_defaults(func=cmd_month)
+
+    s = sub.add_parser("range", parents=[common])
+    s.add_argument("date"); s.add_argument("days", type=int, default=7, nargs="?")
+    s.set_defaults(func=cmd_range)
+
+    s = sub.add_parser("find",  parents=[common])
+    s.add_argument("query")
+    s.set_defaults(func=cmd_find)
+
+    s = sub.add_parser("add",   parents=[common])
+    s.add_argument("title")
+    s.add_argument("--at", required=True, help='AppleScript date, e.g. "tomorrow 3pm"')
+    s.add_argument("--duration", type=int, default=60, help="minutes (default 60)")
+    s.add_argument("--calendar", help="calendar name (default: first writable)")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(func=cmd_add)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

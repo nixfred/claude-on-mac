@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+note: list, search, read, and write Apple Notes.
+
+Read uses SQLite metadata for speed; body access uses AppleScript (because the
+note bodies in NoteStore.sqlite are gzip + proprietary protobuf and unsafe to
+parse directly).
+
+Read commands:
+  note list [N]                 N most-recently-modified notes (default 30)
+  note folders                  list folders with note counts
+  note find <query>             substring search across titles
+  note show "<title>"           print the body of a note (via AppleScript)
+
+Write commands (consent-gated):
+  note new "<title>" --folder <f> [--body "<html>"] [--yes]
+  note append "<title>" --body "<html>" [--yes]
+
+NEVER write to NoteStore.sqlite directly. Body field is gzip+protobuf;
+direct writes corrupt notes and break iCloud sync. Always AppleScript.
+
+Read-only by default. Writes require --yes per individual call.
+"""
+from __future__ import annotations
+import argparse, json, os, shutil, sqlite3, subprocess, sys
+
+DB = os.path.expanduser(
+    "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+)
+
+
+def open_db() -> sqlite3.Connection:
+    if not os.path.exists(DB):
+        sys.exit(f"NoteStore.sqlite not found at {DB}")
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def osascript(src: str, timeout: int = 30) -> str:
+    if not shutil.which("osascript"):
+        sys.exit("osascript not found")
+    proc = subprocess.run(["osascript", "-e", src], capture_output=True,
+                          text=True, timeout=timeout)
+    if proc.returncode != 0:
+        sys.exit(f"AppleScript error: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def cmd_list(args):
+    con = open_db()
+    rows = con.execute("""
+        SELECT
+          datetime(o.ZMODIFICATIONDATE+978307200,'unixepoch','localtime') AS modified,
+          o.ZTITLE1 AS title,
+          f.ZTITLE2 AS folder
+        FROM ZICCLOUDSYNCINGOBJECT o
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK = o.ZFOLDER
+        WHERE o.ZTITLE1 IS NOT NULL
+        ORDER BY o.ZMODIFICATIONDATE DESC
+        LIMIT ?""", (args.n,)).fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2, ensure_ascii=False)); return
+    for r in rows:
+        folder = f"[{r['folder']}]  " if r["folder"] else ""
+        modified = r["modified"] or "(unknown)"
+        print(f"  {modified}  {folder}{r['title']}")
+
+
+def cmd_folders(args):
+    con = open_db()
+    rows = con.execute("""
+        SELECT f.ZTITLE2 AS folder, COUNT(*) AS notes
+        FROM ZICCLOUDSYNCINGOBJECT o
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK = o.ZFOLDER
+        WHERE o.ZTITLE1 IS NOT NULL AND f.ZTITLE2 IS NOT NULL
+        GROUP BY folder ORDER BY notes DESC""").fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2)); return
+    for r in rows:
+        print(f"  {r['notes']:>4}  {r['folder']}")
+
+
+def cmd_find(args):
+    con = open_db()
+    q = f"%{args.query}%"
+    rows = con.execute("""
+        SELECT
+          datetime(o.ZMODIFICATIONDATE+978307200,'unixepoch','localtime') AS modified,
+          o.ZTITLE1 AS title,
+          f.ZTITLE2 AS folder
+        FROM ZICCLOUDSYNCINGOBJECT o
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK = o.ZFOLDER
+        WHERE o.ZTITLE1 LIKE ?
+        ORDER BY o.ZMODIFICATIONDATE DESC LIMIT ?""", (q, args.n)).fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2, ensure_ascii=False)); return
+    for r in rows:
+        folder = f"[{r['folder']}]  " if r["folder"] else ""
+        print(f"  {r['modified']}  {folder}{r['title']}")
+
+
+def cmd_show(args):
+    title_e = args.title.replace('"', '\\"')
+    src = f'''
+    tell application "Notes"
+      set found to (every note whose name is "{title_e}")
+      if (count of found) = 0 then
+        set found to (every note whose name contains "{title_e}")
+      end if
+      if (count of found) = 0 then error "no note matching {title_e}"
+      set targetN to item 1 of found
+      return "TITLE: " & (name of targetN) & linefeed & "FOLDER: " & (name of container of targetN) & linefeed & "BODY:" & linefeed & (body of targetN)
+    end tell
+    '''
+    print(osascript(src))
+
+
+def cmd_new(args):
+    if not args.folder:
+        sys.exit("error: --folder required (use `note folders` to see options)")
+    title_e  = args.title.replace('"','\\"')
+    folder_e = args.folder.replace('"','\\"')
+    body_e   = (args.body or args.title).replace('"','\\"')
+    script = f'''
+    tell application "Notes"
+      tell folder "{folder_e}"
+        make new note with properties {{name:"{title_e}", body:"{body_e}"}}
+      end tell
+    end tell
+    '''
+    if not args.yes:
+        print("DRY RUN (pass --yes to actually create)")
+        print(f"  folder: {args.folder}")
+        print(f"  title : {args.title!r}")
+        print(f"  body  : {body_e[:120]!r}{'...' if len(body_e) > 120 else ''}")
+        print("AppleScript:")
+        for line in script.splitlines(): print(f"  {line}")
+        return
+    osascript(script)
+    print("created.")
+
+
+def cmd_append(args):
+    title_e = args.title.replace('"','\\"')
+    add_e   = args.body.replace('"','\\"')
+    script = f'''
+    tell application "Notes"
+      set found to (every note whose name is "{title_e}")
+      if (count of found) = 0 then
+        set found to (every note whose name contains "{title_e}")
+      end if
+      if (count of found) = 0 then error "no note matching {title_e}"
+      set targetN to item 1 of found
+      set body of targetN to (body of targetN) & "<br>" & "{add_e}"
+      return "appended to: " & (name of targetN)
+    end tell
+    '''
+    if not args.yes:
+        print("DRY RUN (pass --yes to actually append)")
+        print(f"  match: name contains/is {args.title!r}")
+        print(f"  add  : {add_e[:120]!r}{'...' if len(add_e) > 120 else ''}")
+        print("AppleScript:")
+        for line in script.splitlines(): print(f"  {line}")
+        return
+    print(osascript(script))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("list",    parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_list)
+    sub.add_parser("folders",     parents=[common]).set_defaults(func=cmd_folders)
+    s = sub.add_parser("find",    parents=[common]); s.add_argument("query"); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_find)
+    s = sub.add_parser("show",    parents=[common]); s.add_argument("title"); s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("new",     parents=[common]); s.add_argument("title"); s.add_argument("--folder"); s.add_argument("--body"); s.add_argument("--yes", action="store_true"); s.set_defaults(func=cmd_new)
+    s = sub.add_parser("append",  parents=[common]); s.add_argument("title"); s.add_argument("--body", required=True); s.add_argument("--yes", action="store_true"); s.set_defaults(func=cmd_append)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

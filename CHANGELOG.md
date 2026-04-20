@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.2.0 , 2026-04-20
+
+### Added
+- **`~/bin/cal`** Calendar helper: `calendars`, `today`, `tomorrow`, `week`, `month`, `range`, `find`, `add` (write requires `--yes` and `--calendar`).
+- **`~/bin/rem`** Reminders helper: `lists`, `open [<list>]`, `due`, `find`, `add`, `done` (write requires `--yes`). Note: Reminders.app via AppleScript is fundamentally slow on modern macOS (CloudKit round-trips per list); 5+ second reads are normal, the helper bumps timeout to 300s.
+- **`~/bin/note`** Notes helper: `list`, `folders`, `find`, `show` (body via AppleScript), `new`, `append` (writes require `--yes`). Reads use SQLite metadata for speed; never writes to NoteStore.sqlite.
+- **`~/bin/mail`** Mail read helper: `accounts`, `inbox`, `unread`, `search`, `from`, `today`, `domains`, `show <ROWID>`, `show-id <Message-ID>`. Walks `.emlx` files for body retrieval.
+- **`docs/agent-workflows.md`**: synthesis patterns for the agent. Workflows for "how am I doing", relationship analysis, inbox triage, send protocol, internal-write protocol, recall queries. THIS IS THE FILE THAT TURNS DATA INTO USEFUL HELP.
+- **`docs/memory-init.md`**: first-run protocol for the agent to build user-context memory (top contacts classification, account routing, default destinations, do-not-touch zones).
+
+### Changed
+- **`AGENTS.md`** install protocol now installs all 9 helpers (was 5), walks the new memory-init step, references the new agent-workflows doc.
+- **`README.md`** capability table shows all six Apple apps as ✅ shipped.
+
+### Net effect
+The toolkit is now functionally complete enough that any Claude Code on any Mac can replicate the analyses we did to validate it on the build host: read all surfaces, send with consent, run a relationship-arc analysis, do an emotional/life-state read, triage an inbox. Synthesis quality still depends on the model on the other end, but the data layer and the workflow patterns are both shipped.
+
 ## v1.1.0 , 2026-04-19
 
 ### Added
