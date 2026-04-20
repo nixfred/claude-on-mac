@@ -267,6 +267,14 @@ But really, paste the magic line. The whole point is your AI does the install wi
 
 ---
 
+## 🐧 Using claude-on-mac from Linux
+
+Primary workstation isn't the Mac? See [`docs/remote-ssh.md`](./docs/remote-ssh.md) for a ~15-minute setup that installs thin SSH shims on your Linux box and forwards each helper over SSH to the Mac. Tailscale is the recommended transport. The nine helpers in `bin/` stay on the Mac unchanged; the shim is one basename-dispatched bash script.
+
+The consent model is transport-agnostic: dry-run is still the default, `--yes` is still required per send, and the `CONSENT-GATED SEND` banner streams through SSH stderr into your Linux terminal.
+
+---
+
 ## 🧠 The architecture in one paragraph
 
 The repo gives your AI agent a strategy (read SQLite, write AppleScript, never write to Apple's SQLite stores directly), a TCC permissions checklist (Full Disk Access for Messages / Notes / Mail SQLite; per-app Automation grants for AppleScript writes), and small CLI helpers it can compose with `bash`. Everything is plain-text discoverable. Everything is grep-able. Everything is auditable. Apple Journal is the one thing nobody can do programmatically yet, so we document the workaround instead of pretending.

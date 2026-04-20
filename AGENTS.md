@@ -218,4 +218,8 @@ In this order:
 
 Read the relevant `docs/*.md` page. The whole repo is designed so that any future you, or any other Claude Code instance, can pick up where you left off without re-discovering the gotchas.
 
+## If the user is on Linux (not on the Mac)
+
+If Claude Code is running on Linux / a DGX / any non-Mac host and the Apple data lives on a remote Mac, stop and read `docs/remote-ssh.md` before Step 1. The install protocol above still runs — but locally on the Mac once, over SSH — and then the user sets up thin shims on the Linux side. TCC grants must cover `sshd-keygen-wrapper` (Full Disk Access) in addition to the user's terminal, and Automation grants must be warmed from the Mac's console (the TCC dialogs can't be clicked through SSH). The consent rule in `CONSENT.md` is unchanged; the `CONSENT-GATED SEND` banner streams through SSH stderr.
+
 Now go make the user's life easier. Carefully.

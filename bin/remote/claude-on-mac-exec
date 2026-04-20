@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# claude-on-mac remote shim: forward a helper invocation to $CLAUDE_ON_MAC_TARGET
+# over SSH. Invoked via a symlink whose basename matches a helper on the Mac side
+# (e.g. `ln -s claude-on-mac-exec imsg` → running `imsg recent 5` execs
+# `ssh $CLAUDE_ON_MAC_TARGET imsg recent 5`).
+#
+# Design notes:
+# - Single script, basename-dispatched. Adding a helper on the Mac side needs only
+#   one new symlink here; no code change.
+# - ControlMaster amortizes the SSH handshake across calls (~50ms warm vs ~300ms cold).
+# - `exec ssh` replaces the shell, so stdout / stderr / exit code propagate unchanged.
+#   The CONSENT-GATED SEND banner that `bin/imsg-send` writes to stderr streams
+#   through to the Linux terminal verbatim; the consent contract is transport-agnostic.
+# - `printf %q` quotes each argument for the remote shell. Do not hand-roll escaping.
+set -euo pipefail
+
+target="${CLAUDE_ON_MAC_TARGET:-}"
+if [[ -z "$target" ]]; then
+  echo "claude-on-mac: CLAUDE_ON_MAC_TARGET is unset." >&2
+  echo "  Set it to user@host, e.g. export CLAUDE_ON_MAC_TARGET=alice@mac.tail1234.ts.net" >&2
+  echo "  See docs/remote-ssh.md for the full setup." >&2
+  exit 2
+fi
+
+cmd="$(basename "$0")"
+sock="${CLAUDE_ON_MAC_CONTROLPATH:-$HOME/.ssh/claude-on-mac-%r@%h:%p}"
+
+remote_argv=""
+for a in "$@"; do remote_argv+=" $(printf '%q' "$a")"; done
+
+exec ssh \
+  -o ControlMaster=auto \
+  -o ControlPersist=10m \
+  -o ControlPath="$sock" \
+  -o ServerAliveInterval=30 \
+  "$target" \
+  "$cmd$remote_argv"

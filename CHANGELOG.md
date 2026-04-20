@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.3.0 , 2026-04-20
+
+Remote-mode support: a Claude Code instance running on Linux (or any non-Mac host) can now drive the nine Mac-side helpers over SSH, without Python, a daemon, or an MCP server on either end. The helpers in `bin/` are unchanged; the shim just makes them network-addressable.
+
+### Added
+- **`bin/remote/claude-on-mac-exec`** — one bash script, basename-dispatched. Each invocation execs `ssh $CLAUDE_ON_MAC_TARGET <basename> "$@"`. Uses SSH `ControlMaster`/`ControlPersist` so handshake cost amortizes to ~50ms warm (~300ms cold). `printf %q` quotes each argument safely for the remote shell.
+- **Nine symlinks under `bin/remote/`** — `imsg`, `imsg-send`, `contacts`, `cal`, `rem`, `note`, `mail`, `mail-send`, `tcc-check` — all pointing at `claude-on-mac-exec`. Basename dispatch keeps this list in lock-step with `bin/` automatically: future helpers need one new symlink, no code change.
+- **`docs/remote-ssh.md`** — the one honest doc for remote setup. Covers reachability (Tailscale recommended, mDNS acceptable, public SSH unsupported), enabling Remote Login, granting FDA to `/usr/libexec/sshd-keygen-wrapper`, warming per-app Automation grants from the Mac console (unavoidable ceremony — TCC dialogs can't be approved over SSH), Linux-side symlink and env-var setup, smoke tests, and a failure-mode table.
+- **README.md "Using claude-on-mac from Linux"** — one short section pointing at the new doc. Does not disturb the main install flow or the "small toolkit" framing.
+- **AGENTS.md "If the user is on Linux"** appendix — ~8 lines telling the installing agent to read `docs/remote-ssh.md` first when Claude Code isn't on the target Mac.
+
+### Unchanged
+- Every helper in `bin/`. The shim is pure transport; no helper needed to learn about SSH.
+- `CONSENT.md`. Consent is about per-message human authorization, not transport. `bin/imsg-send`'s stderr banner streams through SSH unmodified and still blocks sends without `--yes`.
+- `AGENTS.md` local install protocol (Steps 1–7). Remote mode is a separate self-serve path, not a second code path in the main install.
+
+### Explicit non-goals (deferred)
+- No UI-driving AppleScript for granting FDA to sshd — documented click-path only, to avoid a fragility surface that Apple churns every macOS release.
+- No auto-install of Tailscale. If the user doesn't have it, the doc points them at `tailscale.com/download` and stops there.
+- No topology detection, reachability probe, or comfort-mode branch in AGENTS.md. Remote setup assumes a power user working self-serve from `docs/remote-ssh.md`. If that turns out to be wrong in practice, graduate later.
+
 ## v1.2.2 , 2026-04-20
 
 Second round of fixes from the cross-host install feedback. The v1.2.1 fixes all landed, but verifying them on the second Mac surfaced THREE more real UX issues, all addressed here.
