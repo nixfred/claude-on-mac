@@ -409,11 +409,21 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     # Top-level convenience flags (also added to each subparser via parents=
     # so they work POST-subcommand, e.g. `imsg from "+1..." 6 --chrono`)
+    # These live on BOTH the parent (so they parse before the subcommand) and on
+    # each subparser via parents=[common] (so they parse after it). The subparser
+    # copies MUST default to SUPPRESS: a plain store_true defaults to False, and
+    # the subparser writes that False into the namespace AFTER the parent already
+    # set True for a pre-subcommand flag -- silently clobbering it, so
+    # `imsg --json recent 5` was ignored. With SUPPRESS the subparser only sets
+    # these when the flag actually appears after the subcommand; otherwise the
+    # parent's value survives. The parent copies keep a real False default so the
+    # attributes always exist.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--json", action="store_true", help="emit JSON")
-    common.add_argument("--chrono", action="store_true",
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="emit JSON")
+    common.add_argument("--chrono", action="store_true", default=argparse.SUPPRESS,
                         help="print oldest to newest instead of newest to oldest")
-    common.add_argument("--no-names", action="store_true",
+    common.add_argument("--no-names", action="store_true", default=argparse.SUPPRESS,
                         help="do not resolve handles via Contacts")
     # also accept on the parent for `imsg --json recent 5` style
     p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
