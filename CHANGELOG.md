@@ -32,7 +32,7 @@ Second round of fixes from the cross-host install feedback. The v1.2.1 fixes all
 - **`AGENTS.md` Step 3.5 PATH remediation is now shell-aware**. v1.2.1 suggested `echo ... >> ~/.zshrc`, which silently fails for the ~half of macOS users who use bash (Apple shipped bash as default until macOS 10.15, plenty of users still running it). Now detects `$SHELL` and picks `~/.zshrc` or `~/.bashrc` accordingly. Also notes the `~/.bash_profile` gotcha (login shells source it AFTER `.bashrc`, so PATH manipulations there can override earlier work) and suggests auditing existing `export PATH` lines before adding a third.
 
 ### Retracted (from the v1.2.1 feedback)
-- The `imsg recent doesn't exist` item was a false positive caused by the brew-installed Rust `imsg` CLI shadowing our helper in PATH. Our `imsg` does have `recent`; the nixf agent was invoking the wrong binary. Step 3.5 (PATH collision check) is the right fix, already in v1.2.1. Retraction captured in the nixf install feedback addendum.
+- The `imsg recent doesn't exist` item was a false positive caused by the brew-installed Rust `imsg` CLI shadowing our helper in PATH. Our `imsg` does have `recent`; the agent was invoking the wrong binary. Step 3.5 (PATH collision check) is the right fix, already in v1.2.1. Retraction captured in the install feedback addendum.
 
 ## v1.2.1 , 2026-04-20
 

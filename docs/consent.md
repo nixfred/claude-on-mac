@@ -30,7 +30,7 @@ The line: would another person see this? If yes, consent gate. If no, proceed.
 Two acceptable forms:
 
 1. **Pre-discussed.** The recipient, content, and tone have been agreed in this conversation. "Send Alice a quick `running 10 min late` text" + a previous draft you've reviewed = consent.
-2. **Direct one-shot instruction.** "Send Bob a hello at +1 706 202 4891 telling him what we just did" = consent for that one specific send.
+2. **Direct one-shot instruction.** "Send Bob a hello at +1 555 555 0100 telling him what we just did" = consent for that one specific send.
 
 Vague encouragement does NOT count:
 - "Use the tools you need" → not consent for any send
