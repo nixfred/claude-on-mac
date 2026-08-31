@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.4.0 , 2026-08-30
+
+`imsg` learns what a real iMessage client needs. Driven by [Blip](https://github.com/nixfred/blip), an Omarchy bar plugin that uses this toolkit over the remote shim as its entire Mac side.
+
+### Added
+- **`imsg groups [N]`** — group chats with the metadata a sender needs: the bare `chat_identifier` that message rows carry, the **full AppleScript GUID** (`any;+;<id>`) that `imsg-send --chat-id` requires, the `display_name` (empty for unnamed groups), and the member handles. Sending to a group must go through `--chat-id <guid>`: a group message's `handle` field is whichever member spoke last, and sending to *that* silently DMs one person while you think you're addressing the group.
+
+### Changed
+- **Recently Deleted is hidden by default.** macOS keeps deleted messages in a 30-day bin (`chat_recoverable_message_join`) that is still in `chat.db`, and iCloud syncs phone-side deletions into it. Every `imsg` read used to include those rows, so a conversation you deleted on your iPhone kept showing up for a month. `recent`/`from`/`thread`/`search` now read through a subquery that excludes them. `IMSG_INCLUDE_DELETED=1` restores the old behaviour. `contacts`/`chats`/`analyze` still count deleted rows toward last-activity and totals.
+
+
 ## v1.3.0 , 2026-04-20
 
 Remote-mode support: a Claude Code instance running on Linux (or any non-Mac host) can now drive the nine Mac-side helpers over SSH, without Python, a daemon, or an MCP server on either end. The helpers in `bin/` are unchanged; the shim just makes them network-addressable.

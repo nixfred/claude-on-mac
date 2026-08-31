@@ -159,6 +159,7 @@ imsg thread <handle> [N]     # oldest first
 imsg search <text> [N]       # LIKE search across text + attributedBody
 imsg contacts [N]            # handles ranked by recency, with names
 imsg chats [N]               # 1:1 + group chats by recency
+imsg groups [N]              # group chats with guid (for imsg-send --chat-id) + members
 imsg --json recent 5         # JSON
 imsg --no-names recent 5     # skip Contacts resolution (faster on cold cache)
 ```

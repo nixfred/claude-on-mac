@@ -14,6 +14,7 @@ Subcommands:
   thread <handle> [N], same as `from`, oldest→newest
   contacts, list known handles with message counts
   chats, list chats (group + 1:1) with last activity
+  groups [N], group chats with the AppleScript GUID needed to send to them
 
 All output is `ts | who | text` (or JSON with --json).
 """
@@ -179,10 +180,19 @@ def render(rows, as_json: bool, with_names: bool = True) -> None:
         print(f"{fmt_ts(r['date'])}  {who:>30}{chat_tag}: {text}")
 
 
-BASE_SELECT = """
+# Recently Deleted (the 30-day bin, synced from iPhone via Messages in iCloud)
+# keeps its rows in chat.db. Hide them by default, or a conversation deleted on
+# the phone lingers in every client for a month. IMSG_INCLUDE_DELETED=1 shows them.
+MESSAGE_SRC = (
+    "message"
+    if os.environ.get("IMSG_INCLUDE_DELETED") == "1"
+    else "(SELECT * FROM message WHERE ROWID NOT IN (SELECT message_id FROM chat_recoverable_message_join))"
+)
+
+BASE_SELECT = f"""
     SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
            m.service, h.id AS handle, c.chat_identifier, c.room_name
-    FROM message m
+    FROM {MESSAGE_SRC} m
     LEFT JOIN handle h ON h.ROWID = m.handle_id
     LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
     LEFT JOIN chat c ON c.ROWID = cmj.chat_id
@@ -292,6 +302,54 @@ def cmd_chats(con, args):
     for r in rows:
         name = r["display_name"] or r["room_name"] or r["chat_identifier"]
         print(f"{fmt_ts(r['last_date'])}  {r['n']:>5}  {r['service_name']:>8}  {name}")
+
+
+def cmd_groups(con, args):
+    """Group chats with the metadata a sender needs: the bare chat_identifier
+    that appears in message rows, the full GUID that AppleScript's `chat id`
+    requires (`any;+;<id>`), the display_name (empty for unnamed groups), and
+    the member handles. Sending to a group MUST use --chat-id <guid>; a group
+    message's `handle` is whichever member spoke last, and sending to that
+    silently DMs one person."""
+    rows = con.execute(
+        """
+        SELECT c.chat_identifier, c.guid, c.display_name,
+               (SELECT GROUP_CONCAT(h.id, ',')
+                  FROM chat_handle_join chj JOIN handle h ON h.ROWID = chj.handle_id
+                 WHERE chj.chat_id = c.ROWID) AS participants,
+               (SELECT MAX(m.date)
+                  FROM chat_message_join cmj JOIN message m ON m.ROWID = cmj.message_id
+                 WHERE cmj.chat_id = c.ROWID) AS last_date
+        FROM chat c
+        WHERE c.style = 43
+        ORDER BY last_date DESC
+        LIMIT ?""",
+        (args.n,),
+    ).fetchall()
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "chat": r["chat_identifier"],
+                        "guid": r["guid"],
+                        "name": r["display_name"] or "",
+                        "participants": (r["participants"] or "").split(",") if r["participants"] else [],
+                        "last": fmt_ts(r["last_date"]) if r["last_date"] else None,
+                    }
+                    for r in rows
+                ],
+                indent=2,
+            )
+        )
+        return
+    for r in rows:
+        members = ", ".join(
+            (name_for(h) if not args.no_names else None) or h
+            for h in ((r["participants"] or "").split(",") if r["participants"] else [])
+        )
+        name = r["display_name"] or members or r["chat_identifier"]
+        print(f"{fmt_ts(r['last_date']) if r['last_date'] else '':19}  {r['guid']}  {name}")
 
 
 def cmd_analyze(con, args):
@@ -438,6 +496,7 @@ def main() -> None:
     s = sub.add_parser("search",   parents=[common]); s.add_argument("query"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_search)
     s = sub.add_parser("contacts", parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_contacts)
     s = sub.add_parser("chats",    parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_chats)
+    s = sub.add_parser("groups",   parents=[common]); s.add_argument("n", nargs="?", type=int, default=2000); s.set_defaults(func=cmd_groups)
     s = sub.add_parser("analyze",  parents=[common],
                        help="relationship arc analysis for one handle")
     s.add_argument("handle")
