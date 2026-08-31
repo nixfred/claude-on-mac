@@ -247,7 +247,7 @@ def enrich(con, rows, with_names: bool):
     rowids = [r["ROWID"] for r in kept]
     for a in _chunked_in(
         con,
-        """SELECT maj.message_id AS mid, a.transfer_name AS name,
+        """SELECT maj.message_id AS mid, a.ROWID AS aid, a.transfer_name AS name,
                   a.mime_type AS mime, a.total_bytes AS bytes
            FROM message_attachment_join maj
            JOIN attachment a ON a.ROWID = maj.attachment_id
@@ -257,7 +257,9 @@ def enrich(con, rows, with_names: bool):
         rowids,
     ):
         extras.setdefault(a["mid"], {}).setdefault("attachments", []).append(
-            {"name": a["name"], "mime": a["mime"], "bytes": a["bytes"]}
+            # id as a STRING: attachment ROWIDs are 64-bit and JS number
+            # consumers lose precision past 2^53.
+            {"id": str(a["aid"]), "name": a["name"], "mime": a["mime"], "bytes": a["bytes"]}
         )
 
     # Inline-reply context: resolve originator guids (often outside the window).
@@ -525,6 +527,106 @@ def cmd_groups(con, args):
         print(f"{fmt_ts(r['last_date']) if r['last_date'] else '':19}  {r['guid']}  {name}")
 
 
+ATTACHMENTS_ROOT = os.path.expanduser("~/Library/Messages/Attachments")
+ATTACH_MAX_BYTES = 100 * 1024 * 1024  # hard ceiling, deliberately no flag
+
+
+def cmd_attachment(con, args):
+    """Stream one attachment's bytes to stdout, for a remote client to cache.
+
+    Hardening (the id comes from an untrusted client over ssh):
+    - decimal-only id;
+    - the attachment must join to a VISIBLE message (the Recently Deleted
+      filter applies — a deleted conversation's media must not be fetchable);
+    - the resolved file must live under ~/Library/Messages/Attachments
+      (commonpath, not string prefix), be a regular file opened O_NOFOLLOW,
+      and the DESCRIPTOR is streamed after fstat — no reopen-by-path window;
+    - hard 100 MB ceiling, checked on the fstat'd size and again while
+      streaming in case the file grows.
+    --jpeg converts image/* (HEIC in practice) through sips first so the
+    Linux side never needs an HEIC decoder.
+    """
+    if not re.fullmatch(r"[0-9]{1,18}", args.id):
+        sys.exit("error: attachment id must be decimal digits")
+    row = con.execute(
+        f"""SELECT a.filename, a.mime_type
+            FROM attachment a
+            JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+            JOIN {MESSAGE_SRC} m ON m.ROWID = maj.message_id
+            WHERE a.ROWID = ? AND a.transfer_name IS NOT NULL
+            LIMIT 1""",
+        (int(args.id),),
+    ).fetchone()
+    if not row or not row["filename"]:
+        sys.exit("error: no such visible attachment")
+
+    path = os.path.realpath(os.path.expanduser(row["filename"]))
+    root = os.path.realpath(ATTACHMENTS_ROOT)
+    if os.path.commonpath([path, root]) != root:
+        sys.exit("error: attachment path escapes the Messages store")
+
+    # Ceiling applies to the SOURCE before any conversion — sips must not be
+    # fed an arbitrarily large input just because its output would shrink.
+    try:
+        if os.lstat(path).st_size > ATTACH_MAX_BYTES:
+            sys.exit(f"error: attachment exceeds {ATTACH_MAX_BYTES} bytes")
+    except OSError:
+        sys.exit("error: attachment file missing on disk")
+
+    src = path
+    tmp = None
+    if args.jpeg and (row["mime_type"] or "").startswith("image/"):
+        import subprocess
+        import tempfile
+
+        fd_t, tmp = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd_t)
+        r = subprocess.run(
+            ["sips", "-s", "format", "jpeg", path, "--out", tmp],
+            capture_output=True, timeout=60,
+        )
+        if r.returncode != 0:
+            os.unlink(tmp)
+            sys.exit(f"error: sips conversion failed: {r.stderr.decode()[:200]}")
+        src = tmp
+
+    try:
+        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            st = os.fstat(fd)
+            import stat as stat_mod
+
+            if not stat_mod.S_ISREG(st.st_mode):
+                sys.exit("error: not a regular file")
+            # Close the reopen-by-path window: the DESCRIPTOR we stream must
+            # be the same inode the validated path resolves to right now.
+            # (Residual: sips above reopens by path; the store is Apple-owned
+            # 0700, so parent-swap there requires owning the account anyway.)
+            st_now = os.stat(src)
+            if (st.st_dev, st.st_ino) != (st_now.st_dev, st_now.st_ino):
+                sys.exit("error: attachment changed identity mid-read")
+            if st.st_size > ATTACH_MAX_BYTES:
+                sys.exit(f"error: attachment exceeds {ATTACH_MAX_BYTES} bytes")
+            sent = 0
+            while True:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    break
+                sent += len(chunk)
+                if sent > ATTACH_MAX_BYTES:
+                    sys.exit("error: file grew past the ceiling mid-stream")
+                sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        finally:
+            os.close(fd)
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def cmd_analyze(con, args):
     """Relationship-arc analysis for one handle: lifetime totals, by-month,
     hour-of-day, initiation balance, late-night ratio, message length.
@@ -678,6 +780,12 @@ def main() -> None:
                        help="relationship arc analysis for one handle")
     s.add_argument("handle")
     s.set_defaults(func=cmd_analyze)
+    s = sub.add_parser("attachment", parents=[common],
+                       help="stream one attachment's bytes to stdout (id from --rich)")
+    s.add_argument("id")
+    s.add_argument("--jpeg", action="store_true",
+                   help="convert image/* (HEIC) to JPEG via sips before streaming")
+    s.set_defaults(func=cmd_attachment)
 
     args = p.parse_args()
     with open_db() as con:

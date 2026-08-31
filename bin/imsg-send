@@ -129,24 +129,148 @@ def find_service_id(stype: str) -> str:
     return matches[0]["id"]
 
 
-def applescript_send_participant(handle: str, service_id: str, text: str) -> str:
-    h = handle.replace('"', '\\"')
-    t = text.replace("\\", "\\\\").replace('"', '\\"')
+# ---------- file attachments (Sequoia Pictures-folder staging) ----------
+#
+# `send POSIX file` silently fails on Sequoia (message shows "Not Delivered",
+# chat.db error=25) from ~/Documents, ~/Desktop, /tmp — anywhere EXCEPT the
+# Pictures folder (macscripter.net/t/sequoia-messages-send-file/76468).
+# A dot-subfolder of Pictures works too (verified 2026-08-31: state=5, sent=1).
+# Messages copies the file into ~/Library/Messages/Attachments before upload,
+# so the staged copy can be deleted as soon as the send returns.
+#
+# Files arrive on STDIN, never as a Mac filesystem path: accepting arbitrary
+# paths would let any remote caller exfiltrate any readable Mac file.
+
+OUTBOX = os.path.expanduser("~/Pictures/.blip-outbox")
+MAX_FILE_BYTES = 100 * 1024 * 1024  # hard server-side ceiling, no override
+OUTBOX_GC_SECONDS = 3600
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._ -]")
+
+
+def as_q(s: str) -> str:
+    """Escape a value for interpolation into a double-quoted AppleScript
+    string. Backslash FIRST, then quote — quoting alone lets `\\"` terminate
+    the string and inject script."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _checked_outbox() -> str:
+    """The outbox must be a real directory we own — a symlink here would turn
+    gc_outbox into an arbitrary-delete primitive."""
+    import stat as stat_mod
+
+    os.makedirs(OUTBOX, mode=0o700, exist_ok=True)
+    st = os.lstat(OUTBOX)
+    if stat_mod.S_ISLNK(st.st_mode) or not stat_mod.S_ISDIR(st.st_mode):
+        sys.exit("error: outbox is not a real directory")
+    if st.st_uid != os.getuid():
+        sys.exit("error: outbox is not owned by this user")
+    return OUTBOX
+
+
+def stage_stdin_file(name: str) -> str:
+    """Read the attachment from stdin into a fresh per-send subdirectory of
+    the Pictures outbox, KEEPING the caller's filename (it is what the
+    recipient sees). Refuses > MAX_FILE_BYTES while streaming. A two-level
+    subfolder of ~/Pictures still passes the Sequoia send quirk (verified
+    2026-08-31: state=5, sent=1)."""
+    import uuid
+
+    base = SAFE_NAME_RE.sub("_", os.path.basename(name or "file"))[:120].strip(". ") or "file"
+    outbox = _checked_outbox()
+    gc_outbox()
+    d = os.path.join(outbox, uuid.uuid4().hex[:12])
+    os.mkdir(d, 0o700)
+    path = os.path.join(d, base)
+    total = 0
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            while True:
+                chunk = sys.stdin.buffer.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_FILE_BYTES:
+                    raise SystemExit(f"error: attachment exceeds {MAX_FILE_BYTES} bytes")
+                f.write(chunk)
+    except BaseException:
+        unstage(path)
+        raise
+    if total == 0:
+        unstage(path)
+        sys.exit("error: empty attachment on stdin")
+    return path
+
+
+def unstage(path: str) -> None:
+    """Remove a staged file and its per-send directory."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    try:
+        os.rmdir(os.path.dirname(path))
+    except OSError:
+        pass
+
+
+def gc_outbox() -> None:
+    """Remove staged leftovers older than an hour (crashed prior runs):
+    per-send subdirectories and legacy flat files. Never follows symlinks."""
+    import time
+
+    now = time.time()
+    try:
+        for entry in os.scandir(OUTBOX):
+            try:
+                if now - entry.stat(follow_symlinks=False).st_mtime <= OUTBOX_GC_SECONDS:
+                    continue
+                if entry.is_file(follow_symlinks=False):
+                    os.unlink(entry.path)
+                elif entry.is_dir(follow_symlinks=False):
+                    for sub in os.scandir(entry.path):
+                        if sub.is_file(follow_symlinks=False):
+                            os.unlink(sub.path)
+                    os.rmdir(entry.path)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def applescript_send_file_participant(handle: str, service_id: str, path: str) -> str:
     return (
         f'tell application "Messages"\n'
-        f'  set svc to service id "{service_id}"\n'
-        f'  set p to participant "{h}" of svc\n'
-        f'  send "{t}" to p\n'
+        f'  set svc to service id "{as_q(service_id)}"\n'
+        f'  set p to participant "{as_q(handle)}" of svc\n'
+        f'  send POSIX file "{as_q(path)}" to p\n'
+        f'end tell\n'
+    )
+
+
+def applescript_send_file_chat(chat_guid: str, path: str) -> str:
+    return (
+        f'tell application "Messages"\n'
+        f'  send POSIX file "{as_q(path)}" to chat id "{as_q(chat_guid)}"\n'
+        f'end tell\n'
+    )
+
+
+def applescript_send_participant(handle: str, service_id: str, text: str) -> str:
+    return (
+        f'tell application "Messages"\n'
+        f'  set svc to service id "{as_q(service_id)}"\n'
+        f'  set p to participant "{as_q(handle)}" of svc\n'
+        f'  send "{as_q(text)}" to p\n'
         f'end tell\n'
     )
 
 
 def applescript_send_chat(chat_guid: str, text: str) -> str:
-    g = chat_guid.replace('"', '\\"')
-    t = text.replace("\\", "\\\\").replace('"', '\\"')
     return (
         f'tell application "Messages"\n'
-        f'  send "{t}" to chat id "{g}"\n'
+        f'  send "{as_q(text)}" to chat id "{as_q(chat_guid)}"\n'
         f'end tell\n'
     )
 
@@ -202,6 +326,12 @@ def main() -> None:
                    help="List Messages services and exit")
     p.add_argument("--list-self", action="store_true",
                    help="Print auto-detected self-handles (own iMessage/SMS addresses)")
+    p.add_argument("--file-stdin", action="store_true",
+                   help="Read ONE attachment from stdin and send it. Stages via "
+                        "~/Pictures/.blip-outbox (Sequoia AppleScript quirk). "
+                        "Any text becomes a SECOND message, reported per-part.")
+    p.add_argument("--name", default="file",
+                   help="Filename for --file-stdin (shown to the recipient)")
     p.add_argument("text", nargs="*", help="Message body (joined with spaces)")
     args = p.parse_args()
 
@@ -215,7 +345,7 @@ def main() -> None:
         return
 
     text = " ".join(args.text).strip()
-    if not text:
+    if not text and not args.file_stdin:
         sys.exit("error: empty message text")
     if len(text) > MAX_LEN:
         sys.exit(f"error: message too long ({len(text)} > {MAX_LEN} chars)")
@@ -230,8 +360,9 @@ def main() -> None:
             )
             text = cleaned
 
+    # Resolve the recipient once; text and file sends share it.
+    handle = service_id = None
     if args.chat_id:
-        script = applescript_send_chat(args.chat_id, text)
         recipient = f"chat {args.chat_id}"
     else:
         if args.self:
@@ -255,24 +386,57 @@ def main() -> None:
             )
 
         service_id = find_service_id(args.service)
-        script = applescript_send_participant(handle, service_id, text)
         recipient = f"{handle} via {args.service}"
+
+    def build(kind: str, payload: str) -> str:
+        if kind == "file":
+            return (applescript_send_file_chat(args.chat_id, payload) if args.chat_id
+                    else applescript_send_file_participant(handle, service_id, payload))
+        return (applescript_send_chat(args.chat_id, payload) if args.chat_id
+                else applescript_send_participant(handle, service_id, payload))
 
     if not args.yes:
         print("DRY RUN (pass --yes to actually send)")
         print(f"recipient: {recipient}")
-        print(f"text     : {text!r}")
-        print("AppleScript:")
-        print("  " + script.replace("\n", "\n  "))
+        if args.file_stdin:
+            print(f"file     : <stdin> as {args.name!r} (not read in dry run)")
+        if text:
+            print(f"text     : {text!r}")
+            print("AppleScript:")
+            print("  " + build("text", text).replace("\n", "\n  "))
         return
 
-    consent_banner(recipient, text)
-    rc, out, err = run_applescript(script)
-    if rc != 0:
-        sys.exit(f"send failed (rc={rc}): {err}")
-    if out:
-        print(out)
-    print("sent.")
+    # File first, then text — two AppleScript sends, reported per-part so a
+    # retry never re-sends the half that already worked.
+    parts_failed = []
+    if args.file_stdin:
+        staged = stage_stdin_file(args.name)
+        consent_banner(recipient, f"[file: {os.path.basename(staged)}]")
+        try:
+            rc, out, err = run_applescript(build("file", staged))
+        except subprocess.TimeoutExpired:
+            rc, err = 1, "osascript timed out"
+        finally:
+            # Messages copies the file into its own store before uploading.
+            unstage(staged)
+        if rc != 0:
+            parts_failed.append(f"file ({err})")
+        else:
+            print("file: sent.")
+    if text:
+        consent_banner(recipient, text)
+        try:
+            rc, out, err = run_applescript(build("text", text))
+        except subprocess.TimeoutExpired:
+            rc, out, err = 1, "", "osascript timed out"
+        if rc != 0:
+            parts_failed.append(f"text ({err})")
+        else:
+            if out:
+                print(out)
+            print("text: sent." if args.file_stdin else "sent.")
+    if parts_failed:
+        sys.exit("send failed: " + "; ".join(parts_failed))
 
 
 if __name__ == "__main__":

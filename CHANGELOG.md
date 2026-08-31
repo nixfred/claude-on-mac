@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.6.0 , 2026-08-31
+
+Attachments cross the bridge, both directions. Driven by Blip Tier 2; every mechanism verified live against a real chat.db and Messages.app on Sequoia.
+
+### Added
+- **`imsg attachment <id> [--jpeg]`** — streams one attachment's bytes to stdout (ids come from `--rich` JSON, which now carries `id` per attachment as a STRING — 64-bit ROWIDs lose precision in JS numbers). Hardened for untrusted remote callers: decimal-only id; the attachment must join to a VISIBLE message (Recently Deleted media is not fetchable); realpath + `commonpath` containment under `~/Library/Messages/Attachments`; `O_NOFOLLOW` open, fstat'd descriptor streamed with a dev/ino identity check; hard 100 MB ceiling applied to the SOURCE before any conversion and re-checked while streaming. `--jpeg` converts `image/*` (HEIC in practice) through `sips` so Linux clients never need an HEIC decoder.
+- **`imsg-send --file-stdin --name <name>`** — sends a file read from STDIN. Never accepts a Mac filesystem path: a remote caller must ship the bytes, so the send tool cannot be used to exfiltrate local files. Staging uses the Sequoia workaround: `send POSIX file` silently fails (`error=25`, "Not Delivered") from anywhere EXCEPT the Pictures folder, so files stage in a per-send subdirectory of `~/Pictures/.blip-outbox` (two levels deep verified delivered) keeping the recipient-visible filename, and are removed post-send (Messages copies into its own store first) with a 1-hour GC for crashed runs. The outbox is verified to be a real, owned, non-symlink directory before any GC. Text alongside a file becomes a second message with per-part results, so a retry never re-sends the half that worked.
+
+### Fixed
+- **AppleScript injection**: every interpolated value (handle, chat guid, service id, text, path) now escapes backslashes before quotes. Previously a crafted handle containing `\"` could break out of the generated script.
+- `osascript` timeouts no longer skip staged-file cleanup or per-part reporting.
+
+### Notes for remote (ssh shim) users
+- A connectivity preflight like `ssh host true` before the real command EATS STDIN and silently empties `--file-stdin` payloads. Use `ssh -n` for probes. (The bundled `bin/remote/` shim has no preflight and is unaffected.)
+
+
 ## v1.5.1 , 2026-08-31
 
 ### Fixed
