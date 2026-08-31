@@ -381,6 +381,24 @@ def cmd_from(con, args):
 
 
 def cmd_thread(con, args):
+    if args.chat:
+        # Exact chat_identifier match — the ONLY way to load a group (its
+        # 32-hex / chat<digits> id never matches a handle LIKE), and exact
+        # for DMs too. Clients previously scanned `recent 1500` and filtered,
+        # which both cost more and missed anything older than the window.
+        # `imsg thread --chat <id> 40`: the count lands in the (unused)
+        # handle slot, so accept it from either positional.
+        n = int(args.handle) if str(args.handle).isdigit() else args.n
+        rows = con.execute(
+            base_select(con)
+            + " WHERE c.chat_identifier = ? ORDER BY m.date DESC LIMIT ?",
+            (args.chat, n),
+        ).fetchall()
+        render(reversed(rows), args.json,
+               with_names=not args.no_names, con=con, rich=args.rich)
+        return
+    if not args.handle:
+        sys.exit("error: pass a handle, or --chat <chat_identifier>")
     rows = con.execute(
         base_select(con)
         + " WHERE h.id LIKE ? ORDER BY m.date DESC LIMIT ?",
@@ -818,7 +836,7 @@ def main() -> None:
 
     s = sub.add_parser("recent",   parents=[common]); s.add_argument("n", nargs="?", type=int, default=20); s.set_defaults(func=cmd_recent)
     s = sub.add_parser("from",     parents=[common]); s.add_argument("handle"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_from)
-    s = sub.add_parser("thread",   parents=[common]); s.add_argument("handle"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_thread)
+    s = sub.add_parser("thread",   parents=[common]); s.add_argument("handle", nargs="?", default=""); s.add_argument("n", nargs="?", type=int, default=50); s.add_argument("--chat", default="", help="exact chat_identifier (groups: 32-hex / chat<digits>)"); s.set_defaults(func=cmd_thread)
     s = sub.add_parser("search",   parents=[common]); s.add_argument("query"); s.add_argument("n", nargs="?", type=int, default=50); s.set_defaults(func=cmd_search)
     s = sub.add_parser("contacts", parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_contacts)
     s = sub.add_parser("chats",    parents=[common]); s.add_argument("n", nargs="?", type=int, default=30); s.set_defaults(func=cmd_chats)
