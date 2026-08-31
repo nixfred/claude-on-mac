@@ -309,6 +309,13 @@ def render(rows, as_json: bool, with_names: bool = True, con=None, rich: bool = 
                 "service": r["service"],
                 "chat": r["room_name"] or r["chat_identifier"],
                 "text": message_text(r),
+                # The APPLE-side read state — is_read syncs from the iPhone
+                # via Messages in iCloud, so a client can mirror the phone's
+                # badge. Own messages are trivially "read".
+                "read": bool(r["is_from_me"]) or bool(r["is_read"]),
+                # Tapback rows are messages too, but no Apple client counts
+                # them toward a badge — flag them so clients can match.
+                "tapback": bool(r["assoc_type"] and 2000 <= r["assoc_type"] < 4000),
             }
             if rich:
                 row["guid"] = r["guid"]
@@ -349,7 +356,7 @@ def base_select(con) -> str:
         _BASE_SELECT_CACHE = f"""
             SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
                    m.service, h.id AS handle, c.chat_identifier, c.room_name,
-                   m.guid, m.date_read, {edit_cols}
+                   m.guid, m.date_read, m.is_read, {edit_cols}
                    m.associated_message_type AS assoc_type,
                    m.thread_originator_guid AS orig_guid,
                    m.expressive_send_style_id AS style_id,
