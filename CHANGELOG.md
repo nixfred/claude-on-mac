@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.7.0 , 2026-08-31
+
+### Added
+- **`imsg watch`** — blocks forever, emitting one timestamp line whenever `chat.db` or its WAL changes (0.4 s local mtime sampling; no fswatch install, no sqlite polling). The line is an **invalidation, never content** — a consumer learns only "something changed" and fetches privately. Exits on `BrokenPipeError` when the consuming ssh session goes away. Built for [Blip](https://github.com/nixfred/blip)'s real-time delivery: worst-case latency fell from a 6 s poll to ~2 s message-to-screen.
+
+
 ## v1.6.0 , 2026-08-31
 
 Attachments cross the bridge, both directions. Driven by Blip Tier 2; every mechanism verified live against a real chat.db and Messages.app on Sequoia.

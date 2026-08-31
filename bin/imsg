@@ -627,6 +627,45 @@ def cmd_attachment(con, args):
                 pass
 
 
+def cmd_watch(con, args):
+    """Block forever, emitting one line whenever chat.db changes — a push
+    channel for remote clients (Blip) that otherwise poll.
+
+    The line is just a unix timestamp: an INVALIDATION, never content —
+    anything sniffing the stream learns only "a message happened". Detection
+    is mtime on chat.db and its WAL (every Messages write touches the WAL;
+    checkpoints touch the db), sampled every 0.4 s — a local stat is
+    microseconds, so this is effectively free and needs no fswatch install.
+    Exits on SIGPIPE/BrokenPipeError when the consumer (the ssh session)
+    goes away."""
+    import time
+
+    wal = DB_PATH + "-wal"
+
+    def sig():
+        try:
+            s = os.stat(DB_PATH).st_mtime_ns
+        except OSError:
+            return None
+        try:
+            w = os.stat(wal).st_mtime_ns
+        except OSError:
+            w = 0
+        return (s, w)
+
+    last = sig()
+    print("ready", flush=True)
+    try:
+        while True:
+            time.sleep(0.4)
+            cur = sig()
+            if cur != last:
+                last = cur
+                print(int(time.time()), flush=True)
+    except BrokenPipeError:
+        pass
+
+
 def cmd_analyze(con, args):
     """Relationship-arc analysis for one handle: lifetime totals, by-month,
     hour-of-day, initiation balance, late-night ratio, message length.
@@ -786,6 +825,9 @@ def main() -> None:
     s.add_argument("--jpeg", action="store_true",
                    help="convert image/* (HEIC) to JPEG via sips before streaming")
     s.set_defaults(func=cmd_attachment)
+    s = sub.add_parser("watch", parents=[common],
+                       help="emit a line whenever chat.db changes (push channel)")
+    s.set_defaults(func=cmd_watch)
 
     args = p.parse_args()
     with open_db() as con:
