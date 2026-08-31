@@ -16,7 +16,7 @@
 ![Claude Code](https://img.shields.io/badge/for-Claude%20Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white)
 ![Linux → Mac via SSH](https://img.shields.io/badge/Linux%20%E2%86%92%20Mac-via%20SSH-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ![License: MIT](https://img.shields.io/badge/license-MIT-34C759?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-1.3.0-FF3B30?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.5.0-FF3B30?style=for-the-badge)
 ![Status](https://img.shields.io/badge/status-shipped-32D74B?style=for-the-badge)
 
 <br>

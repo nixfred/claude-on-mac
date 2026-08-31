@@ -155,21 +155,159 @@ def message_text(row: sqlite3.Row) -> str:
     return row["text"] or decode_attributed_body(row["attributedBody"]) or ""
 
 
-def render(rows, as_json: bool, with_names: bool = True) -> None:
+# ---------- --rich enrichment (tapbacks, read receipts, replies, attachments) ----------
+
+# Tapback rows are their own messages pointing at a target via
+# associated_message_guid ("p:0/<GUID>" / "bp:<GUID>"). 2xxx adds, 3xxx removes;
+# a sender's latest row for a target wins.
+TAPBACK_EMOJI = {0: "❤️", 1: "\U0001f44d", 2: "\U0001f44e",
+                 3: "\U0001f602", 4: "‼️", 5: "❓"}
+
+_COLS: set[str] | None = None
+
+
+def _has_col(con, name: str) -> bool:
+    global _COLS
+    if _COLS is None:
+        _COLS = {r["name"] for r in con.execute("PRAGMA table_info(message)")}
+    return name in _COLS
+
+
+def _strip_assoc(guid: str | None) -> str:
+    """'p:0/ABC' / 'bp:ABC' / 'ABC' → 'ABC'."""
+    if not guid:
+        return ""
+    if "/" in guid:
+        return guid.rsplit("/", 1)[1]
+    if ":" in guid:
+        return guid.rsplit(":", 1)[1]
+    return guid
+
+
+def _effect_name(style_id: str | None) -> str | None:
+    """'com.apple.messages.effect.CKConfettiEffect' → 'confetti'."""
+    if not style_id:
+        return None
+    last = style_id.rsplit(".", 1)[-1]
+    if last.startswith("CK"):
+        last = last[2:]
+    if last.endswith("Effect"):
+        last = last[: -len("Effect")]
+    return last.lower() or None
+
+
+def _chunked_in(con, sql_tmpl: str, ids: list, chunk: int = 500):
+    for i in range(0, len(ids), chunk):
+        part = ids[i : i + chunk]
+        marks = ",".join("?" * len(part))
+        yield from con.execute(sql_tmpl.format(marks=marks), part)
+
+
+def enrich(con, rows, with_names: bool):
+    """Per-ROWID extras for --rich JSON. Returns (kept_rows, extras) where
+    tapback rows are folded onto their targets and dropped from kept_rows."""
+    rows = list(rows)
+    has_emoji = _has_col(con, "associated_message_emoji")
+    has_edit = _has_col(con, "date_edited")
+
+    kept = [r for r in rows if not (r["assoc_type"] and 2000 <= r["assoc_type"] < 4000)]
+    targets = {r["guid"]: r["ROWID"] for r in kept if r["guid"]}
+    extras: dict[int, dict] = {r["ROWID"]: {} for r in kept}
+
+    # Tapbacks: scan every assoc row in the DB (type-filtered), net per sender+target.
+    emoji_col = ", m.associated_message_emoji AS emo" if has_emoji else ""
+    latest: dict[tuple[str, str], sqlite3.Row] = {}
+    for r in con.execute(
+        f"""SELECT m.associated_message_guid AS ag, m.associated_message_type AS t,
+                   m.is_from_me, m.date, h.id AS handle{emoji_col}
+            FROM {MESSAGE_SRC} m LEFT JOIN handle h ON h.ROWID = m.handle_id
+            WHERE m.associated_message_type BETWEEN 2000 AND 3999"""
+    ):
+        tg = _strip_assoc(r["ag"])
+        if tg not in targets:
+            continue
+        who = "me" if r["is_from_me"] else (r["handle"] or "?")
+        key = (who, tg)
+        if key not in latest or r["date"] > latest[key]["date"]:
+            latest[key] = r
+    for (who, tg), r in latest.items():
+        if not (2000 <= r["t"] < 3000):
+            continue  # net-removed
+        kind = r["t"] - 2000
+        emoji = (r["emo"] if has_emoji and r["emo"] else None) or TAPBACK_EMOJI.get(kind, "⭐")
+        extras[targets[tg]].setdefault("tapbacks", []).append({
+            "emoji": emoji,
+            "from_me": bool(r["is_from_me"]),
+            "by": None if r["is_from_me"] else (name_for(r["handle"]) if with_names else None) or r["handle"],
+        })
+
+    # Attachments (transfer_name is null mid-download; skip those rows).
+    rowids = [r["ROWID"] for r in kept]
+    for a in _chunked_in(
+        con,
+        """SELECT maj.message_id AS mid, a.transfer_name AS name,
+                  a.mime_type AS mime, a.total_bytes AS bytes
+           FROM message_attachment_join maj
+           JOIN attachment a ON a.ROWID = maj.attachment_id
+           WHERE a.transfer_name IS NOT NULL AND maj.message_id IN ({marks})""",
+        rowids,
+    ):
+        extras.setdefault(a["mid"], {}).setdefault("attachments", []).append(
+            {"name": a["name"], "mime": a["mime"], "bytes": a["bytes"]}
+        )
+
+    # Inline-reply context: resolve originator guids (often outside the window).
+    origins = sorted({r["orig_guid"] for r in kept if r["orig_guid"]})
+    osnip: dict[str, dict] = {}
+    if origins:
+        for o in _chunked_in(
+            con,
+            "SELECT guid, text, attributedBody, is_from_me FROM message WHERE guid IN ({marks})",
+            origins,
+        ):
+            osnip[o["guid"]] = {
+                "text": (o["text"] or decode_attributed_body(o["attributedBody"]) or "")[:120],
+                "from_me": bool(o["is_from_me"]),
+            }
+
+    for r in kept:
+        e = extras[r["ROWID"]]
+        if r["is_from_me"] and r["date_read"]:
+            e["read_at"] = fmt_ts(r["date_read"])
+        if has_edit and r["date_edited"]:
+            e["edited"] = True
+        if has_edit and r["date_retracted"]:
+            e["retracted"] = True
+        if r["orig_guid"] and r["orig_guid"] in osnip:
+            e["reply_to"] = osnip[r["orig_guid"]]
+        fx = _effect_name(r["style_id"])
+        if fx:
+            e["effect"] = fx
+        if r["is_audio_message"]:
+            e["audio"] = True
+    return kept, extras
+
+
+def render(rows, as_json: bool, with_names: bool = True, con=None, rich: bool = False) -> None:
     if as_json:
+        extras: dict[int, dict] = {}
+        if rich and con is not None:
+            rows, extras = enrich(con, rows, with_names)
         out = []
         for r in rows:
-            out.append(
-                {
-                    "ts": fmt_ts(r["date"]),
-                    "from_me": bool(r["is_from_me"]),
-                    "handle": r["handle"],
-                    "name": name_for(r["handle"]) if with_names else None,
-                    "service": r["service"],
-                    "chat": r["room_name"] or r["chat_identifier"],
-                    "text": message_text(r),
-                }
-            )
+            row = {
+                "ts": fmt_ts(r["date"]),
+                "from_me": bool(r["is_from_me"]),
+                "handle": r["handle"],
+                "name": name_for(r["handle"]) if with_names else None,
+                "service": r["service"],
+                "chat": r["room_name"] or r["chat_identifier"],
+                "text": message_text(r),
+            }
+            if rich:
+                row["guid"] = r["guid"]
+                row.update(extras.get(r["ROWID"], {}))
+            out.append(row)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return
     for r in rows:
@@ -189,52 +327,75 @@ MESSAGE_SRC = (
     else "(SELECT * FROM message WHERE ROWID NOT IN (SELECT message_id FROM chat_recoverable_message_join))"
 )
 
-BASE_SELECT = f"""
-    SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
-           m.service, h.id AS handle, c.chat_identifier, c.room_name
-    FROM {MESSAGE_SRC} m
-    LEFT JOIN handle h ON h.ROWID = m.handle_id
-    LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-    LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-"""
+_BASE_SELECT_CACHE: str | None = None
+
+
+def base_select(con) -> str:
+    """Column list adapts to the schema: date_edited/date_retracted arrived in
+    macOS 13, associated_message_emoji in 14 — older DBs must still query."""
+    global _BASE_SELECT_CACHE
+    if _BASE_SELECT_CACHE is None:
+        edit_cols = (
+            "m.date_edited, m.date_retracted,"
+            if _has_col(con, "date_edited")
+            else "0 AS date_edited, 0 AS date_retracted,"
+        )
+        _BASE_SELECT_CACHE = f"""
+            SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
+                   m.service, h.id AS handle, c.chat_identifier, c.room_name,
+                   m.guid, m.date_read, {edit_cols}
+                   m.associated_message_type AS assoc_type,
+                   m.thread_originator_guid AS orig_guid,
+                   m.expressive_send_style_id AS style_id,
+                   m.is_audio_message
+            FROM {MESSAGE_SRC} m
+            LEFT JOIN handle h ON h.ROWID = m.handle_id
+            LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+        """
+    return _BASE_SELECT_CACHE
 
 
 def cmd_recent(con, args):
     rows = con.execute(
-        BASE_SELECT + " ORDER BY m.date DESC LIMIT ?", (args.n,)
+        base_select(con) + " ORDER BY m.date DESC LIMIT ?", (args.n,)
     ).fetchall()
-    render(reversed(rows) if args.chrono else rows, args.json, with_names=not args.no_names)
+    render(reversed(rows) if args.chrono else rows, args.json,
+           with_names=not args.no_names, con=con, rich=args.rich)
 
 
 def cmd_from(con, args):
     rows = con.execute(
-        BASE_SELECT
+        base_select(con)
         + " WHERE h.id LIKE ? ORDER BY m.date DESC LIMIT ?",
         (f"%{args.handle}%", args.n),
     ).fetchall()
-    render(reversed(rows) if args.chrono else rows, args.json, with_names=not args.no_names)
+    render(reversed(rows) if args.chrono else rows, args.json,
+           with_names=not args.no_names, con=con, rich=args.rich)
 
 
 def cmd_thread(con, args):
     rows = con.execute(
-        BASE_SELECT
+        base_select(con)
         + " WHERE h.id LIKE ? ORDER BY m.date DESC LIMIT ?",
         (f"%{args.handle}%", args.n),
     ).fetchall()
-    render(reversed(rows), args.json, with_names=not args.no_names)
+    render(reversed(rows), args.json,
+           with_names=not args.no_names, con=con, rich=args.rich)
 
 
 def cmd_search(con, args):
     # text column is null for newer messages; also scan attributedBody as bytes
     rows = con.execute(
-        BASE_SELECT
+        base_select(con)
         + """
         WHERE m.text LIKE ?
            OR (m.attributedBody IS NOT NULL AND instr(m.attributedBody, CAST(? AS BLOB)) > 0)
         ORDER BY m.date DESC LIMIT ?""",
         (f"%{args.query}%", args.query, args.n),
     ).fetchall()
-    render(reversed(rows) if args.chrono else rows, args.json, with_names=not args.no_names)
+    render(reversed(rows) if args.chrono else rows, args.json,
+           with_names=not args.no_names, con=con, rich=args.rich)
 
 
 def cmd_contacts(con, args):
@@ -491,10 +652,14 @@ def main() -> None:
                         help="print oldest to newest instead of newest to oldest")
     common.add_argument("--no-names", action="store_true", default=argparse.SUPPRESS,
                         help="do not resolve handles via Contacts")
+    common.add_argument("--rich", action="store_true", default=argparse.SUPPRESS,
+                        help="JSON only: fold tapbacks onto their targets and add "
+                             "read_at/edited/retracted/reply_to/attachments/effect/audio")
     # also accept on the parent for `imsg --json recent 5` style
     p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--chrono", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--no-names", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--rich", action="store_true", help=argparse.SUPPRESS)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.5.0 , 2026-08-31
+
+`imsg --rich`: everything a bubble view needs, in one flag. Driven by Blip's push toward iMessage parity — read receipts, tapbacks, inline replies, edits, and attachments all live in `chat.db`; they were just never surfaced.
+
+### Added
+- **`--rich` flag** (JSON only, off by default — non-rich output is byte-identical to v1.4.0). Each message row gains:
+  - `guid` — the message GUID.
+  - `read_at` — when the recipient read YOUR message (`date_read`, from-me rows only). Inbound display of read receipts; *sending* them remains impossible.
+  - `tapbacks` — reactions folded onto their target: `[{emoji, from_me, by}]`. Tapback rows themselves (`associated_message_type` 2000–3999) are **dropped from the output** — no more `Loved "…"` pseudo-messages. Net state per sender (a 3xxx removal cancels the 2xxx add; latest wins). Custom-emoji tapbacks use `associated_message_emoji` where the schema has it (macOS 14+).
+  - `reply_to` — inline-reply context `{text, from_me}` resolved from `thread_originator_guid`, even when the originator is outside the fetched window.
+  - `edited` / `retracted` — flags from `date_edited` / `date_retracted` (schema-guarded; pre-Ventura DBs still work).
+  - `attachments` — `[{name, mime, bytes}]` via `message_attachment_join` (rows without a `transfer_name` — mid-download — are skipped).
+  - `effect` — screen/bubble effect short name (`confetti`, `lasers`, …) from `expressive_send_style_id`.
+  - `audio` — audio-message flag.
+- **Schema adaptivity** — the column list is built per-DB via `PRAGMA table_info`, so older macOS versions that lack `date_edited`/`associated_message_emoji` keep working.
+
+### Changed
+- `bin/imsg-send` deployed copies should be re-synced: v1.1.0+ consent banner, `--list-self`, and dash-scrubbing were in the repo but some hosts still ran an April copy.
+
+
 ## v1.4.0 , 2026-08-30
 
 `imsg` learns what a real iMessage client needs. Driven by [Blip](https://github.com/nixfred/blip), an Omarchy bar plugin that uses this toolkit over the remote shim as its entire Mac side.
