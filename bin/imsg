@@ -655,6 +655,7 @@ def cmd_watch(con, args):
 
     last = sig()
     print("ready", flush=True)
+    ticks = 0
     try:
         while True:
             time.sleep(0.4)
@@ -662,6 +663,13 @@ def cmd_watch(con, args):
             if cur != last:
                 last = cur
                 print(int(time.time()), flush=True)
+            # Heartbeat every ~30s: a half-open ssh channel emits nothing
+            # forever, and a silent stream is indistinguishable from a quiet
+            # evening — the client needs a liveness signal to time out on.
+            ticks += 1
+            if ticks >= 75:
+                ticks = 0
+                print("hb", flush=True)
     except BrokenPipeError:
         pass
 
