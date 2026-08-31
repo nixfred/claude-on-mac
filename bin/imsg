@@ -313,7 +313,15 @@ def cmd_groups(con, args):
     silently DMs one person."""
     rows = con.execute(
         """
-        SELECT c.chat_identifier, c.guid, c.display_name,
+        SELECT c.chat_identifier, c.guid,
+               -- display_name can be blanked by an iCloud re-sync; the latest
+               -- rename event (message.group_title) is the durable name.
+               COALESCE(NULLIF(c.display_name, ''),
+                        (SELECT m2.group_title
+                           FROM chat_message_join j2 JOIN message m2 ON m2.ROWID = j2.message_id
+                          WHERE j2.chat_id = c.ROWID AND m2.group_title IS NOT NULL
+                          ORDER BY m2.ROWID DESC LIMIT 1),
+                        '') AS display_name,
                (SELECT GROUP_CONCAT(h.id, ',')
                   FROM chat_handle_join chj JOIN handle h ON h.ROWID = chj.handle_id
                  WHERE chj.chat_id = c.ROWID) AS participants,
