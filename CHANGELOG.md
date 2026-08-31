@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.5.1 , 2026-08-31
+
+### Fixed
+- `--rich` attachments: `.pluginPayloadAttachment` blobs (rich-link-preview
+  internals — a URL message can carry four) are no longer reported as
+  attachments. They are not user files, and they were inflating client layouts.
+
+
 ## v1.5.0 , 2026-08-31
 
 `imsg --rich`: everything a bubble view needs, in one flag. Driven by Blip's push toward iMessage parity — read receipts, tapbacks, inline replies, edits, and attachments all live in `chat.db`; they were just never surfaced.

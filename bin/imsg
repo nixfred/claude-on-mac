@@ -241,7 +241,9 @@ def enrich(con, rows, with_names: bool):
             "by": None if r["is_from_me"] else (name_for(r["handle"]) if with_names else None) or r["handle"],
         })
 
-    # Attachments (transfer_name is null mid-download; skip those rows).
+    # Attachments. transfer_name is null mid-download; .pluginPayloadAttachment
+    # blobs are rich-link-preview internals (a URL message can carry four of
+    # them), not user files — both are noise to a client.
     rowids = [r["ROWID"] for r in kept]
     for a in _chunked_in(
         con,
@@ -249,7 +251,9 @@ def enrich(con, rows, with_names: bool):
                   a.mime_type AS mime, a.total_bytes AS bytes
            FROM message_attachment_join maj
            JOIN attachment a ON a.ROWID = maj.attachment_id
-           WHERE a.transfer_name IS NOT NULL AND maj.message_id IN ({marks})""",
+           WHERE a.transfer_name IS NOT NULL
+             AND a.transfer_name NOT LIKE '%.pluginPayloadAttachment'
+             AND maj.message_id IN ({marks})""",
         rowids,
     ):
         extras.setdefault(a["mid"], {}).setdefault("attachments", []).append(
