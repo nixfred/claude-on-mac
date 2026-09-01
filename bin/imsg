@@ -464,14 +464,18 @@ def cmd_contacts(con, args):
 
 
 def cmd_chats(con, args):
+    # Every conversation, newest activity first — the COMPLETE list a client
+    # should build its sidebar from (deriving it from a window of recent
+    # messages loses every quiet conversation). JSON rows carry a preview of
+    # the latest visible message so the list needs no second query.
     rows = con.execute(
-        """
-        SELECT c.ROWID, c.chat_identifier, c.display_name, c.room_name,
+        f"""
+        SELECT c.ROWID AS cid, c.chat_identifier, c.display_name, c.room_name,
                c.service_name, MAX(m.date) AS last_date,
                COUNT(m.ROWID) AS n
         FROM chat c
         LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
-        LEFT JOIN message m ON m.ROWID = cmj.message_id
+        LEFT JOIN {MESSAGE_SRC} m ON m.ROWID = cmj.message_id
         GROUP BY c.ROWID
         HAVING n > 0
         ORDER BY last_date DESC
@@ -479,21 +483,29 @@ def cmd_chats(con, args):
         (args.n,),
     ).fetchall()
     if args.json:
-        print(
-            json.dumps(
-                [
-                    {
-                        "id": r["chat_identifier"],
-                        "name": r["display_name"] or r["room_name"],
-                        "service": r["service_name"],
-                        "messages": r["n"],
-                        "last": fmt_ts(r["last_date"]),
-                    }
-                    for r in rows
-                ],
-                indent=2,
-            )
-        )
+        out = []
+        for r in rows:
+            last = con.execute(
+                f"""SELECT m.text, m.attributedBody, m.is_from_me, h.id AS handle
+                    FROM chat_message_join cmj
+                    JOIN {MESSAGE_SRC} m ON m.ROWID = cmj.message_id
+                    LEFT JOIN handle h ON h.ROWID = m.handle_id
+                    WHERE cmj.chat_id = ?
+                    ORDER BY m.date DESC LIMIT 1""",
+                (r["cid"],),
+            ).fetchone()
+            out.append({
+                "id": r["chat_identifier"],
+                "name": r["display_name"] or r["room_name"],
+                "service": r["service_name"],
+                "messages": r["n"],
+                "last": fmt_ts(r["last_date"]),
+                "last_text": message_text(last) if last else "",
+                "last_from_me": bool(last["is_from_me"]) if last else False,
+                "last_handle": (last["handle"] if last else None) or "",
+                "last_name": (name_for(last["handle"]) if last and last["handle"] and not args.no_names else None),
+            })
+        print(json.dumps(out, indent=2, ensure_ascii=False))
         return
     for r in rows:
         name = r["display_name"] or r["room_name"] or r["chat_identifier"]
