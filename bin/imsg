@@ -316,6 +316,10 @@ def render(rows, as_json: bool, with_names: bool = True, con=None, rich: bool = 
                 # Tapback rows are messages too, but no Apple client counts
                 # them toward a badge — flag them so clients can match.
                 "tapback": bool(r["assoc_type"] and 2000 <= r["assoc_type"] < 4000),
+                # Delivery failure code on OWN messages (0 = fine). AppleScript
+                # reports success for sends that die later; this is the only
+                # place the truth lands (e.g. 25 = attachment not readable).
+                "error": int(r["error"] or 0) if r["is_from_me"] else 0,
             }
             if rich:
                 row["guid"] = r["guid"]
@@ -356,7 +360,7 @@ def base_select(con) -> str:
         _BASE_SELECT_CACHE = f"""
             SELECT m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody,
                    m.service, h.id AS handle, c.chat_identifier, c.room_name,
-                   m.guid, m.date_read, m.is_read, {edit_cols}
+                   m.guid, m.date_read, m.is_read, m.error, {edit_cols}
                    m.associated_message_type AS assoc_type,
                    m.thread_originator_guid AS orig_guid,
                    m.expressive_send_style_id AS style_id,
