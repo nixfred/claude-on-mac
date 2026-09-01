@@ -203,6 +203,49 @@ def stage_stdin_file(name: str) -> str:
     return path
 
 
+def wait_for_copy(staged: str, timeout: float = 20.0) -> tuple[bool, int]:
+    """After `send POSIX file`, Messages copies the staged file into its own
+    Attachments store — but for a REMOTE recipient that copy (and the upload
+    that reads it) can lag several seconds. Deleting the staged file the
+    moment osascript returns worked for self-sends and silently broke real
+    ones (error 25, "Not Delivered" — found live 2026-08-31, exactly the
+    race the design review warned about).
+
+    Polls chat.db until an attachment row for our basename points at an
+    EXISTING file that is not the staged path. Returns (copy_exists,
+    message_error). On timeout the staged file must be LEFT for the hourly
+    GC rather than yanked out from under an in-flight upload."""
+    import time
+
+    base = os.path.basename(staged)
+    staged_real = os.path.realpath(staged)
+    deadline = time.time() + timeout
+    err = 0
+    while time.time() < deadline:
+        try:
+            con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
+            row = con.execute(
+                """SELECT a.filename, m.error FROM attachment a
+                   JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+                   JOIN message m ON m.ROWID = maj.message_id
+                   WHERE a.transfer_name = ? AND m.is_from_me = 1
+                   ORDER BY a.ROWID DESC LIMIT 1""",
+                (base,),
+            ).fetchone()
+            con.close()
+            if row:
+                err = int(row[1] or 0)
+                if err:
+                    return (False, err)
+                p = os.path.expanduser(row[0] or "")
+                if p and os.path.exists(p) and os.path.realpath(p) != staged_real:
+                    return (True, 0)
+        except (sqlite3.DatabaseError, OSError, ValueError):
+            pass
+        time.sleep(0.5)
+    return (False, err)
+
+
 def unstage(path: str) -> None:
     """Remove a staged file and its per-send directory."""
     try:
@@ -416,13 +459,24 @@ def main() -> None:
             rc, out, err = run_applescript(build("file", staged))
         except subprocess.TimeoutExpired:
             rc, err = 1, "osascript timed out"
-        finally:
-            # Messages copies the file into its own store before uploading.
-            unstage(staged)
         if rc != 0:
+            unstage(staged)
             parts_failed.append(f"file ({err})")
         else:
-            print("file: sent.")
+            # osascript returning 0 proves NOTHING for files — failures
+            # surface later in chat.db. Wait for Messages' own copy before
+            # touching the staged file, and surface a delivery error loudly.
+            copied, msg_err = wait_for_copy(staged)
+            if msg_err:
+                unstage(staged)
+                parts_failed.append(f"file (Messages error {msg_err} — not delivered)")
+            elif copied:
+                unstage(staged)
+                print("file: sent.")
+            else:
+                # Copy not observed yet: leave staging for the hourly GC —
+                # never yank a file an upload might still be reading.
+                print("file: sent (staged copy retained for GC).")
     if text:
         consent_banner(recipient, text)
         try:
