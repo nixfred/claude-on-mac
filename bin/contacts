@@ -42,16 +42,25 @@ ADDRESSBOOK_DIR = os.path.expanduser(
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC
 
 
+def _record_count(path: str) -> int:
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return con.execute("SELECT COUNT(*) FROM ZABCDRECORD").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        return 0
+
+
 def source_dbs() -> list[str]:
-    """All AddressBook-v22.abcddb files (one per source/account)."""
-    paths = sorted(
-        glob(os.path.join(ADDRESSBOOK_DIR, "Sources", "*", "AddressBook-v22.abcddb"))
-    )
-    # Also include the root db if non-trivial
+    """All AddressBook-v22.abcddb files, ordered by source authority."""
+    paths = glob(os.path.join(ADDRESSBOOK_DIR, "Sources", "*", "AddressBook-v22.abcddb"))
+    # Also include the root db if non-trivial.
     root = os.path.join(ADDRESSBOOK_DIR, "AddressBook-v22.abcddb")
     if os.path.exists(root):
         paths.append(root)
-    return paths
+    return sorted(paths, key=lambda path: (-_record_count(path), path))
 
 
 def open_db(path: str) -> sqlite3.Connection:
