@@ -57,8 +57,8 @@ def name_for(handle: str | None) -> str | None:
     if not handle:
         return None
     if _NAME_INDEX is None:
-        idx: dict[str, str] = {}
-        for path in glob(_AB_GLOB):
+        votes: dict[str, dict[str, int]] = {}
+        for path in sorted(glob(_AB_GLOB)):
             try:
                 con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
                 con.row_factory = sqlite3.Row
@@ -70,24 +70,32 @@ def name_for(handle: str | None) -> str | None:
                         "ZORGANIZATION AS org, ZNICKNAME AS nick FROM ZABCDRECORD"
                     )
                 }
+                local: dict[str, str] = {}
                 for r in con.execute(
                     "SELECT ZOWNER AS pk, ZFULLNUMBER AS num FROM ZABCDPHONENUMBER"
                 ):
                     name = names.get(r["pk"])
                     key = _normalize_phone(r["num"] or "")
                     if name and key:
-                        idx.setdefault(key, name)
+                        local.setdefault(key, name)
                 for r in con.execute(
                     "SELECT ZOWNER AS pk, ZADDRESS AS addr FROM ZABCDEMAILADDRESS"
                 ):
                     name = names.get(r["pk"])
                     addr = (r["addr"] or "").strip().lower()
                     if name and addr:
-                        idx.setdefault(addr, name)
+                        local.setdefault(addr, name)
                 con.close()
+                weight = max(len(names), 1)
+                for key, name in local.items():
+                    votes.setdefault(key, {})
+                    votes[key][name] = votes[key].get(name, 0) + weight
             except sqlite3.DatabaseError:
                 continue
-        _NAME_INDEX = idx
+        _NAME_INDEX = {
+            key: max(names.items(), key=lambda vote: (vote[1], vote[0]))[0]
+            for key, names in votes.items()
+        }
     if "@" in handle:
         return _NAME_INDEX.get(handle.strip().lower())
     return _NAME_INDEX.get(_normalize_phone(handle))
