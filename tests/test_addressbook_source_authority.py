@@ -74,6 +74,64 @@ class AddressBookSourceAuthorityTest(unittest.TestCase):
             with patch.object(imsg, "glob", return_value=[str(small), str(other_small), str(primary)]):
                 self.assertEqual(imsg.name_for("+15555550100"), "Correct Name")
 
+    def test_many_small_sources_cannot_outweigh_one_larger_source(self):
+        """Largest source wins outright: small sources never sum together.
+
+        Five 10-record sources agreeing on a stale label total 50 records
+        against a 40-record primary. A vote-accumulating policy would hand
+        the win to the strays; ranking sources must not.
+        """
+        imsg = load_script("imsg")
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            paths = []
+            for n in range(5):
+                small = directory / f"small-{n}.abcddb"
+                make_addressbook(
+                    small,
+                    [("Stale Label", "+15555550100")]
+                    + [(f"Filler {i}", None) for i in range(9)],
+                )
+                paths.append(str(small))
+            primary = directory / "primary.abcddb"
+            make_addressbook(
+                primary,
+                [("Correct Name", "+15555550100")]
+                + [(f"Contact {i}", None) for i in range(39)],
+            )
+            paths.append(str(primary))
+
+            setattr(imsg, "_NAME_INDEX", None)
+            with patch.object(imsg, "glob", return_value=paths):
+                self.assertEqual(imsg.name_for("+15555550100"), "Correct Name")
+
+    def test_imsg_and_contacts_rank_sources_by_the_same_metric(self):
+        """Both helpers must resolve one handle to one name.
+
+        `contacts` orders source DBs by ZABCDRECORD count; `imsg` must rank
+        by that same count, or the two can disagree on the same handle.
+        """
+        imsg = load_script("imsg")
+        contacts = load_script("contacts")
+        with tempfile.TemporaryDirectory() as tmp:
+            addressbook = Path(tmp)
+            small = addressbook / "Sources" / "a-small" / "AddressBook-v22.abcddb"
+            primary = addressbook / "Sources" / "z-primary" / "AddressBook-v22.abcddb"
+            make_addressbook(small, [("Stale Label", "+15555550100")])
+            make_addressbook(
+                primary,
+                [("Correct Name", "+15555550100")]
+                + [(f"Contact {i}", None) for i in range(20)],
+            )
+
+            with patch.object(contacts, "ADDRESSBOOK_DIR", str(addressbook)):
+                ranked = contacts.source_dbs()
+            self.assertEqual(ranked[0], str(primary))
+
+            setattr(imsg, "_NAME_INDEX", None)
+            with patch.object(imsg, "glob", return_value=[str(small), str(primary)]):
+                self.assertEqual(imsg.name_for("+15555550100"), "Correct Name")
+
     def test_contacts_orders_sources_largest_first_with_stable_path_tiebreak(self):
         contacts = load_script("contacts")
         with tempfile.TemporaryDirectory() as tmp:

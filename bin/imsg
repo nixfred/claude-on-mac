@@ -57,8 +57,13 @@ def name_for(handle: str | None) -> str | None:
     if not handle:
         return None
     if _NAME_INDEX is None:
-        votes: dict[str, dict[str, int]] = {}
-        for path in sorted(glob(_AB_GLOB)):
+        # One entry per source DB: (record count, path, handle -> name).
+        # Contacts sources are ranked by ZABCDRECORD count, the same metric
+        # `contacts` source_dbs() uses, so both helpers resolve a handle to
+        # the same name. Largest source wins outright; small sources never
+        # sum together to outvote the primary account.
+        sources: list[tuple[int, str, dict[str, str]]] = []
+        for path in glob(_AB_GLOB):
             try:
                 con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
                 con.row_factory = sqlite3.Row
@@ -86,16 +91,15 @@ def name_for(handle: str | None) -> str | None:
                     if name and addr:
                         local.setdefault(addr, name)
                 con.close()
-                weight = max(len(names), 1)
-                for key, name in local.items():
-                    votes.setdefault(key, {})
-                    votes[key][name] = votes[key].get(name, 0) + weight
+                sources.append((len(names), path, local))
             except sqlite3.DatabaseError:
                 continue
-        _NAME_INDEX = {
-            key: max(names.items(), key=lambda vote: (vote[1], vote[0]))[0]
-            for key, names in votes.items()
-        }
+        idx: dict[str, str] = {}
+        # Descending record count, path as a deterministic tie-breaker.
+        for _, _, local in sorted(sources, key=lambda s: (-s[0], s[1])):
+            for key, name in local.items():
+                idx.setdefault(key, name)
+        _NAME_INDEX = idx
     if "@" in handle:
         return _NAME_INDEX.get(handle.strip().lower())
     return _NAME_INDEX.get(_normalize_phone(handle))

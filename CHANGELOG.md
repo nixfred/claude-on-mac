@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.11.1 , 2026-09-07
+
+### Fixed
+- **Contact name resolution prefers the larger AddressBook source** (#5, thanks @marty0x, fixes #4). When one normalized phone number or email appeared in several source stores, `imsg` kept whichever name filesystem traversal reached first and `contacts` sorted sources lexicographically by UUID — so a small stale or shared account could name a conversation instead of the primary one. Both helpers now rank source DBs by `ZABCDRECORD` count, descending, with the path as a deterministic tie-breaker.
+- **`imsg` and `contacts` now resolve a handle to the same name.** The merged fix left the two helpers on different policies: `contacts` took the largest source outright, while `imsg` accumulated weighted votes, so five 10-record strays (50 votes) still beat a 40-record primary and the two helpers could disagree on one handle. `imsg` now uses largest-source-wins, ranked on the same `ZABCDRECORD` count `contacts` uses.
+
+### Added
+- `tests/test_addressbook_source_authority.py` — stdlib `unittest`, no new dependency. Four cases over temporary SQLite AddressBook fixtures: `imsg` prefers the larger source, many small sources cannot sum past one larger source, `contacts` orders sources largest-first with a stable path tie-break, and both helpers rank on the same metric. Run with `python3 -m unittest discover -s tests`.
+
 ## v1.7.0 , 2026-08-31
 
 ### Added

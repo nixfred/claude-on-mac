@@ -18,7 +18,7 @@ If the current conversation is about *using* claude-on-mac on a user's Mac, you 
 ## Stack
 
 - **Python 3** (stdlib only — no `pip install`, no `requirements.txt`, no virtualenv). Every helper starts with `#!/usr/bin/env python3`. If you're tempted to add a dependency, don't — find a stdlib path.
-- **No build, no compile, no test runner.** There is no CI, no linter config, no pytest. Verification is `tcc-check` (functional probe) plus manual smoke tests per `AGENTS.md` Step 5.
+- **No build, no compile, no CI, no linter config, no pytest.** There is one stdlib `unittest` suite under `tests/` (`python3 -m unittest discover -s tests`) covering logic that can be exercised without a Mac — AddressBook source ranking today. It uses only the standard library, so the no-dependency rule still holds. Anything needing a live Mac is verified by `tcc-check` (functional probe) plus the manual smoke tests in `AGENTS.md` Step 5. Add a test there when a change has Mac-free logic worth pinning; do not reach for pytest.
 - **No daemons, no MCP servers, no API keys.** Everything is `sqlite3 -readonly`, `osascript`, or direct file reads.
 
 ## The architecture decision that drives everything
