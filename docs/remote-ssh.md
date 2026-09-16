@@ -148,6 +148,13 @@ ssh "$CLAUDE_ON_MAC_TARGET" \
    "SELECT text FROM message WHERE is_from_me=1 ORDER BY date DESC LIMIT 1"'
 ```
 
+## Lessons from running this all day (Blip)
+
+- **Use `ssh -n` for every command that does not read stdin.** A bare `ssh mac true` connectivity probe EATS the caller's stdin, which silently empties a following `imsg-send --file-stdin` payload, and makes an interactive script's `read` hit EOF.
+- **Give the Linux side its own key, confined.** In `~/.ssh/authorized_keys` on the Mac: `restrict,command="<dispatcher>",from="<linux host addresses>" ssh-ed25519 ...`, where the dispatcher runs only the read helpers and `imsg-send`. A copied key file then reaches nothing from anywhere else. Pin `from=` to Tailscale addresses; a LAN address can change.
+- **Keep message bodies off argv on both machines** (`imsg-send --text-stdin`). `ssh host imsg-send --yes "text"` puts the text in the Linux process list, the Mac process list and possibly shell history.
+- **The Mac is the trusted computing base.** Anyone with a shell on it reads everything; the confinement above protects the key, not the Mac.
+
 ## Known failure modes
 
 | Symptom | Cause | Fix |

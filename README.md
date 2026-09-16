@@ -12,11 +12,11 @@
 
 <br>
 
-![macOS](https://img.shields.io/badge/macOS-Tahoe%20%7C%20Sequoia%20%7C%20Sonoma-007AFF?style=for-the-badge&logo=apple&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-27%20%7C%20Tahoe%20%7C%20Sequoia%20%7C%20Sonoma-007AFF?style=for-the-badge&logo=apple&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/for-Claude%20Code-D97757?style=for-the-badge&logo=anthropic&logoColor=white)
 ![Linux → Mac via SSH](https://img.shields.io/badge/Linux%20%E2%86%92%20Mac-via%20SSH-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ![License: MIT](https://img.shields.io/badge/license-MIT-34C759?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-1.11.1-FF3B30?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-2.0.0-FF3B30?style=for-the-badge)
 ![Status](https://img.shields.io/badge/status-shipped-32D74B?style=for-the-badge)
 
 <br>

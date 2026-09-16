@@ -150,6 +150,26 @@ imsg-send --list-services                                        # show service 
 - **Verify delivery in chat.db, not from osascript exit code**: `osascript` returns 0 the moment Messages accepts the call, NOT when the message is delivered. Check `is_delivered=1` on the new row in `message` to confirm.
 - **Drafted text must be scrubbed for em/en dashes** before sending on the user's behalf (per `feedback_no_dashes` rule). `imsg-send` auto-warns if dashes are present.
 
+- **Keep message text out of argv.** Anything in argv is visible to every `ps` on the Mac and ends up in shell history and remote logs. `imsg-send --text-stdin` reads the body from stdin; with `--file-stdin`, `--text-stdin-bytes N` sends the first N bytes as the caption, and `--file-bytes N` refuses a short stream (a cut ssh connection must never become a truncated photo). The AppleScript itself goes to `osascript` on stdin, not `-e`.
+- **A group can own several chat rows.** Messages keeps one chat row per service, so a group that moved between iMessage, SMS and RCS leaves rows that share one identifier and differ only by GUID. Exactly one holds the messages. `ORDER BY last_date DESC` sorts the empty shells (NULL last_date) LAST, so a "last row wins" map picked an empty shell, and AppleScript fails with `Can't get chat id (-1728)`. `imsg groups` returns one row per identifier, the one with messages. On one real Mac, 27 of 28 duplicated identifiers were broken this way.
+
+## What chat.db really holds (learned running Blip on it daily)
+
+These were all found by [Blip](https://github.com/nixfred/blip), which reads this database every few seconds from Linux. The helpers here now handle each one.
+
+- **JSON timestamps are UTC ISO-8601** (`2026-09-07T18:33:12Z`) as of v2.0.0. They used to be the Mac's naive wall clock. Compared against a clock in another zone, that string is wrong by hours, and in the DST fall-back hour two messages an hour apart carry the SAME stamp. Fixed-width UTC sorts lexically in time order. Plain-text output keeps local time, because a person reading it wants the time they remember.
+- **Announcements are not messages.** Joins, leaves, renames and location-sharing notices live in `message` with `item_type != 0`, have no text, and are never marked read. Counted as messages they are empty rows that stay unread forever. `imsg` hides them; `groups` still reads rename rows for group names.
+- **Recently Deleted is still in the table** for 30 days (`chat_recoverable_message_join`). Hidden by default; `IMSG_INCLUDE_DELETED=1` shows them.
+- **An unsend is not an edit, and on macOS 26 it never sets `date_retracted`.** Undo Send stamps `date_edited`, clears the body, and lists the withdrawn parts as `rp` in `message_summary_info`. A real edit carries `ec` and keeps its body. `imsg` reads both and reports `retracted` over `edited`.
+- **Send Later rows exist before they are sent.** A scheduled message is written the moment it is queued, dated at the FUTURE send time, with `schedule_type = 2` and `schedule_state = 2` (3 once sent; observed on macOS 27). JSON rows carry `"scheduled": true` while it waits, and `chats` does not use it as the conversation's newest message. Anything that takes a watermark or "last seen" time from the newest row must skip it, or it waits until tomorrow.
+- **iMessage-app cards store U+FFFD as the text.** Ask to Buy, Fitness sharing, Find My and similar put an `MSMessage` archive in `payload_data`; `imsg` reads the sentence Messages itself shows (`ldtext`), then the caption, then the app name.
+- **Newer bodies live only in `attributedBody`**, which SQL `LIKE` cannot case-fold. `imsg search` tries lower, upper and title case.
+- **`is_read` is phone-synced but has ghosts.** It reflects the iPhone through Messages in iCloud, but chat.db keeps years-old `is_read = 0` rows. Never count unread from `is_read` alone.
+- **Marking read IS possible, through the Messages menu, not the database.** `Conversation > Mark All as Read` is scriptable through System Events (needs Accessibility for the calling process) and reaches the iPhone. The menu reads `enabled=false` whenever Messages is in the background (AppKit validates menus against the active app), so a disabled item proves nothing; count unread in chat.db before and after. Never write `is_read` directly. Blip's `imsg-read` does this; it is not in this toolkit because it acts on the user's account.
+- **Tapbacks and edits out are half possible on macOS 26.** Messages has real `Edit > Tapback Message...`, `Reply to Message...` and `Edit Last Message...` menu items, scriptable with SIP on. They act on the SELECTED message, and selecting an arbitrary bubble remotely is the unsolved part. Typing indicators have no menu item.
+- **Outbound attachments must be staged under `~/Pictures`** on Sequoia and later, or Messages fails silently (`error = 25`). `imsg-send --file` handles this.
+- **macOS 27** (27.0, build 26A428): every read path, contacts, photos and sending verified working on 2026-09-16 with no schema change the helpers depend on.
+
 ## Helper: `~/bin/imsg`
 
 ```

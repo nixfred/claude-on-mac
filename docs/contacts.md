@@ -42,6 +42,13 @@ def norm(s):
 
 Suffix matching by last 10 digits handles US numbers correctly. For international numbers, strip the leading `+` and match full digit string.
 
+### What name wins (learned from Blip)
+
+- **Sources are ranked, never counted.** `0` the local "On My Mac" store (no backing account; the owner typed it), `1` the owner's own iCloud, `2` every other synced source (Exchange, Google, CardDAV). Ranks come from `~/Library/Accounts/Accounts4.sqlite`. Within a rank the largest source (`ZABCDRECORD` count) wins outright, path as the tie-break. Sources never sum: counting them let a synced company directory of thousands rename people by volume (Blip), and let several small stale stores outvote the primary account (#4/#5). An unreadable Accounts database puts everything in one rank, so size decides.
+- **Family Sharing child address books are not yours.** Screen Time's Manage Contacts mirrors each child's book onto the parent's Mac as its own CardDAV store, flagged `isChildDelegate` in the Accounts database. Contacts.app hides them from All Contacts and so do both helpers. Without that, two sons' "Mom" cards renamed a wife in every conversation.
+- **One person in several sources is not ambiguity.** "Rob" in iCloud and "Robert" in Exchange is one person. Ambiguity is two DIFFERENT cards in ONE source sharing a number; only that source is skipped for that number. The same card saved twice ("Mom ❤️" and "Mom❤️") is one person after NFKC, casefold and whitespace normalization.
+- **Numbers saved without a country code.** Last-ten-digit matching is a whole national number in North America and wrong almost everywhere else ("123 45 678" in Norway never matched `+4712345678`). The exact key is tried first and decides when it hits. Only when it misses, the card gets the Mac's region (`AppleLocale`, via `bin/calling_codes.py`, 245 regions generated from libphonenumber) and two numbers match when their calling codes agree and one national number ends with the other, at least seven digits shared. A North American card shorter than ten digits has no area code and matches nothing rather than guessing.
+
 ## Helper: `~/bin/contacts`
 
 ```

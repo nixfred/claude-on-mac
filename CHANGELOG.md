@@ -1,5 +1,34 @@
 # Changelog
 
+## v2.0.0 , 2026-09-16
+
+Everything [Blip](https://github.com/nixfred/blip) learned running these helpers against a real chat.db every few seconds for two weeks, brought home. Blip vendored `imsg`, `imsg-send`, `contacts` and `tcc-check` at v1.11.0 and fixed them in place; this release makes claude-on-mac the source again. Thanks to the Blip contributors whose bugs these were (GitHub logins): @Fileri, @adamgamble, @zachwilke, @jefehoser, @johanthoren, @tolewis, @ianswope, and the reporters @jacobaross and @cjoh.
+
+### Changed (breaking)
+- **JSON timestamps are UTC ISO-8601** (`2026-09-07T18:33:12Z`), not the Mac's naive wall clock. The old string was wrong by hours against any clock in another zone and repeated itself in the DST fall-back hour. Plain-text output still shows local time. Consumers that parsed `YYYY-MM-DD HH:MM:SS` must accept ISO-8601.
+
+### Fixed
+- **Group sends failing with `Can't get chat id (-1728)`.** A group that moved between services keeps several chat rows; NULL `last_date` sorted the empty shells last, so they won. `groups` now returns the row with messages.
+- **Announcements** (joins, leaves, renames, location sharing; `item_type != 0`) are no longer returned as empty, forever-unread messages.
+- **Unsend on macOS 26** reports `retracted`, not `edited` (Undo Send never sets `date_retracted`; the withdrawn parts are `rp` in `message_summary_info`).
+- **Send Later:** a scheduled message still waiting carries `"scheduled": true` and is not used as a conversation's newest message.
+- **iMessage-app cards** (Ask to Buy, Fitness, Find My) read as the sentence Messages shows instead of U+FFFD.
+- **`search`** finds capitalized text stored only in `attributedBody`.
+- **Contact names:** sources are ranked (On My Mac, then your iCloud, then other synced accounts) and the largest source wins within a rank, which keeps the #5 fix and stops a large synced directory from renaming people. Family Sharing child address books are skipped. The same card saved twice is one person. Numbers saved without a country code match through the Mac's region (`bin/calling_codes.py`).
+- **A DM keeps its contact name when your own message is newest.**
+- **`imsg-send`:** the AppleScript goes to `osascript` on stdin, never `-e`; a short `--file-stdin` stream is refused; two overlapping sends of the same filename no longer read each other's attachment rows; files that were never observed copying are kept instead of deleted.
+- **`tcc-check` waits 150 s** for a consent dialog. Its 60 s timeout ended the probe while the dialog was still up, and an unanswered dialog is recorded as a denial.
+
+### Added
+- `imsg-send --text-stdin`, `--text-stdin-bytes N` and `--file-bytes N`: message text and captions off argv.
+- `imsg avatar` (contact and group photos), `chats` pin order and conversation clusters, `--hide-spam` / `--hide-unknown`, `--rich` rows with tapbacks, replies, effects, link cards and edits.
+- `contacts resolve`: bounded, read-only JSON identity resolver over stdin (candidates, store fingerprint, handle audit, exact-card details and vCard export via `bin/contact-repair.js`). It never writes to Contacts.
+- Ten more stdlib `unittest` files under `tests/` (phone matching, unsend, app cards, clusters, filtered chats, group photos, Send Later, UTC stamps, chats metadata, contact review). `python3 -m unittest discover -s tests`: 87 tests.
+- Docs: what chat.db really holds (`docs/messages.md`), what name wins (`docs/contacts.md`), an unanswered prompt is a denial (`docs/tcc-permissions.md`), confined keys and `ssh -n` (`docs/remote-ssh.md`). macOS 27 verified.
+
+### Unchanged on purpose
+- The consent contract. `imsg-send` still defaults to dry-run, still needs `--yes` per send, and still prints the full `CONSENT-GATED SEND` banner with a body preview. (Blip's own copy prints only the body length, because its stderr lands in journald.)
+
 ## v1.11.1 , 2026-09-07
 
 ### Fixed

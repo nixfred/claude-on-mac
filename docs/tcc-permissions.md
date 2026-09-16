@@ -46,6 +46,16 @@ Each AppleScript `tell app "X"` triggers a one-time TCC dialog. Approve and you'
 
 - **System Settings → Privacy & Security → Automation** → expand your terminal app → see the list of apps it can drive.
 
+## An unanswered prompt is a denial
+
+macOS keeps an Automation consent dialog up for about two minutes. If nobody clicks it, TCC records a DENIAL (`auth_value 0`, `auth_reason 9`, Prompt Timeout), and on macOS 26 the Settings switch for that record may refuse to turn on. So:
+
+- **Never cut a consent-triggering probe short.** `tcc-check` waits 150 s per prompt for this reason. A 25 s timeout that reported "probably waiting on the Mac's screen" guaranteed the denial it was warning about.
+- **Send the user to the Mac's screen BEFORE the probe runs**, especially over SSH, where the dialog appears on a screen nobody is looking at.
+- **Never fire a prompt the user did not ask for.** A grant nobody wanted could not be switched back off in System Settings on macOS 26.6.2. Keep optional probes (for example System Events for menu scripting) behind an explicit flag.
+- **Recovery with SIP on:** `tccutil reset AppleEvents` clears every app's Automation grants (a path-identified client such as `/usr/libexec/sshd-keygen-wrapper` cannot be reset alone), then re-run the probe and click Allow in time.
+- `tcc-check` has no `--help`: running it runs the probes. Warn the user first.
+
 ## Reset (nuclear option)
 
 If TCC gets confused (dialogs not appearing, false errors), reset all grants for an app:

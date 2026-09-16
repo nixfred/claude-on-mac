@@ -144,6 +144,15 @@ def find_service_id(stype: str) -> str:
 OUTBOX = os.path.expanduser("~/Pictures/.blip-outbox")
 MAX_FILE_BYTES = 100 * 1024 * 1024  # hard server-side ceiling, no override
 OUTBOX_GC_SECONDS = 3600
+# Files imsg-send sent are KEPT here (same <sendid>/<name> subpath as the outbox):
+# for a remote recipient Messages often leaves the attachment row pointing at
+# the outbox path instead of copying into its own store, so deleting the
+# staged file made every photo sent that way un-showable forever.
+# (The .blip-outbox / ~/.blip names are historical, from the Blip client, and
+# kept so existing installs and `imsg attachment` keep finding their files.)
+# `imsg attachment` resolves a missing outbox path to this copy. LRU-capped.
+SENT = os.path.expanduser("~/.blip/sent")
+SENT_CAP_BYTES = 200 * 1024 * 1024
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._ -]")
 
 
@@ -168,7 +177,7 @@ def _checked_outbox() -> str:
     return OUTBOX
 
 
-def stage_stdin_file(name: str) -> str:
+def stage_stdin_file(name: str, expected: int = 0) -> str:
     """Read the attachment from stdin into a fresh per-send subdirectory of
     the Pictures outbox, KEEPING the caller's filename (it is what the
     recipient sees). Refuses > MAX_FILE_BYTES while streaming. A two-level
@@ -176,7 +185,10 @@ def stage_stdin_file(name: str) -> str:
     2026-08-31: state=5, sent=1)."""
     import uuid
 
-    base = SAFE_NAME_RE.sub("_", os.path.basename(name or "file"))[:120].strip(". ") or "file"
+    raw = os.path.basename(name or "file")
+    stem, ext = os.path.splitext(raw)
+    ext = SAFE_NAME_RE.sub("", ext)[:12]          # keep the extension the recipient sees
+    base = (SAFE_NAME_RE.sub("_", stem)[:120 - len(ext)].strip(". ") or "file") + ext
     outbox = _checked_outbox()
     gc_outbox()
     d = os.path.join(outbox, uuid.uuid4().hex[:12])
@@ -200,10 +212,24 @@ def stage_stdin_file(name: str) -> str:
     if total == 0:
         unstage(path)
         sys.exit("error: empty attachment on stdin")
+    if expected and total != expected:
+        # a cut ssh stream must never become a truncated photo in someone's Messages
+        unstage(path)
+        sys.exit(f"error: short file on stdin ({total} of {expected} bytes) — not sent")
     return path
 
 
-def wait_for_copy(staged: str, timeout: float = 20.0) -> tuple[bool, int]:
+def _max_attachment_rowid() -> int:
+    try:
+        con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
+        row = con.execute("SELECT COALESCE(MAX(ROWID), 0) FROM attachment").fetchone()
+        con.close()
+        return int(row[0] or 0)
+    except (sqlite3.DatabaseError, OSError):
+        return 0
+
+
+def wait_for_copy(staged: str, baseline: int = 0, timeout: float = 20.0, chat_ident: str | None = None) -> tuple[bool, int]:
     """After `send POSIX file`, Messages copies the staged file into its own
     Attachments store — but for a REMOTE recipient that copy (and the upload
     that reads it) can lag several seconds. Deleting the staged file the
@@ -225,12 +251,18 @@ def wait_for_copy(staged: str, timeout: float = 20.0) -> tuple[bool, int]:
         try:
             con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
             row = con.execute(
+                # Correlated with THIS send's conversation: two overlapping sends
+                # of image.png used to read each other's rows, and one deleted
+                # the other's staged file on a stray error=25 (Astra C#3).
                 """SELECT a.filename, m.error FROM attachment a
                    JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
                    JOIN message m ON m.ROWID = maj.message_id
-                   WHERE a.transfer_name = ? AND m.is_from_me = 1
+                   JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+                   JOIN chat c ON c.ROWID = cmj.chat_id
+                   WHERE a.transfer_name = ? AND m.is_from_me = 1 AND a.ROWID > ?
+                     AND (? IS NULL OR c.chat_identifier = ?)
                    ORDER BY a.ROWID DESC LIMIT 1""",
-                (base,),
+                (base, baseline, chat_ident, chat_ident),
             ).fetchone()
             con.close()
             if row:
@@ -244,6 +276,43 @@ def wait_for_copy(staged: str, timeout: float = 20.0) -> tuple[bool, int]:
             pass
         time.sleep(0.5)
     return (False, err)
+
+
+def keep_sent(path: str) -> None:
+    """Move a staged per-send directory into ~/.blip/sent (never follows
+    symlinks; falls back to unstage on any error) and LRU-sweep the store."""
+    import shutil
+    import stat as stat_mod
+    import time
+
+    d = os.path.dirname(path)
+    try:
+        os.makedirs(SENT, mode=0o700, exist_ok=True)
+        st = os.lstat(SENT)
+        if stat_mod.S_ISLNK(st.st_mode) or not stat_mod.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError("sent store is not a real directory we own")
+        if os.path.lexists(os.path.join(SENT, os.path.basename(d))):
+            raise OSError("collision")
+        shutil.move(d, os.path.join(SENT, os.path.basename(d)))
+    except (OSError, shutil.Error):
+        unstage(path)
+        return
+    # LRU: oldest per-send dirs go first once the store exceeds the cap.
+    try:
+        entries = []
+        for e in os.scandir(SENT):
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            size = sum(f.stat(follow_symlinks=False).st_size for f in os.scandir(e.path) if f.is_file(follow_symlinks=False))
+            entries.append((e.stat(follow_symlinks=False).st_mtime, size, e.path))
+        total = sum(s for _, s, _ in entries)
+        for _, size, p in sorted(entries):
+            if total <= SENT_CAP_BYTES:
+                break
+            shutil.rmtree(p, ignore_errors=True)
+            total -= size
+    except OSError:
+        pass
 
 
 def unstage(path: str) -> None:
@@ -272,10 +341,13 @@ def gc_outbox() -> None:
                 if entry.is_file(follow_symlinks=False):
                     os.unlink(entry.path)
                 elif entry.is_dir(follow_symlinks=False):
-                    for sub in os.scandir(entry.path):
-                        if sub.is_file(follow_symlinks=False):
-                            os.unlink(sub.path)
-                    os.rmdir(entry.path)
+                    # a send whose copy was never observed: keep it servable
+                    # (~/.blip/sent) instead of deleting the only copy
+                    files = [f for f in os.scandir(entry.path) if f.is_file(follow_symlinks=False)]
+                    if files:
+                        keep_sent(files[0].path)
+                    else:
+                        os.rmdir(entry.path)
             except OSError:
                 continue
     except OSError:
@@ -333,8 +405,10 @@ def has_existing_chat(handle: str, service_name: str) -> bool:
 
 
 def run_applescript(script: str) -> tuple[int, str, str]:
+    # Script on STDIN, not `-e`: the body would otherwise sit in osascript's
+    # argv for every `ps` on the Mac (audit #4).
     proc = subprocess.run(
-        ["osascript", "-e", script], capture_output=True, text=True, timeout=30
+        ["osascript", "-"], input=script, capture_output=True, text=True, timeout=30
     )
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
@@ -373,8 +447,15 @@ def main() -> None:
                    help="Read ONE attachment from stdin and send it. Stages via "
                         "~/Pictures/.blip-outbox (Sequoia AppleScript quirk). "
                         "Any text becomes a SECOND message, reported per-part.")
+    p.add_argument("--file-bytes", type=int, default=0, metavar="N",
+                   help="With --file-stdin: exact byte count expected; a short stream is refused")
     p.add_argument("--name", default="file",
                    help="Filename for --file-stdin (shown to the recipient)")
+    p.add_argument("--text-stdin", action="store_true",
+                   help="Read the message body from stdin (keeps it out of argv)")
+    p.add_argument("--text-stdin-bytes", type=int, default=0, metavar="N",
+                   help="With --file-stdin: the first N bytes of stdin are the UTF-8 "
+                        "caption, the rest is the file")
     p.add_argument("text", nargs="*", help="Message body (joined with spaces)")
     args = p.parse_args()
 
@@ -388,6 +469,19 @@ def main() -> None:
         return
 
     text = " ".join(args.text).strip()
+    if args.text_stdin:
+        if args.file_stdin:
+            sys.exit("error: --text-stdin cannot combine with --file-stdin; use --text-stdin-bytes N")
+        text = sys.stdin.buffer.read(MAX_LEN * 4 + 1).decode("utf-8", "replace").strip()
+    elif args.text_stdin_bytes > 0:
+        if not args.file_stdin:
+            sys.exit("error: --text-stdin-bytes needs --file-stdin")
+        if args.text_stdin_bytes > MAX_LEN * 4:
+            sys.exit("error: caption too long")
+        head = sys.stdin.buffer.read(args.text_stdin_bytes)
+        if len(head) != args.text_stdin_bytes:
+            sys.exit("error: short caption on stdin")
+        text = head.decode("utf-8", "replace").strip()
     if not text and not args.file_stdin:
         sys.exit("error: empty message text")
     if len(text) > MAX_LEN:
@@ -453,8 +547,9 @@ def main() -> None:
     # retry never re-sends the half that already worked.
     parts_failed = []
     if args.file_stdin:
-        staged = stage_stdin_file(args.name)
+        staged = stage_stdin_file(args.name, args.file_bytes)
         consent_banner(recipient, f"[file: {os.path.basename(staged)}]")
+        baseline = _max_attachment_rowid()
         try:
             rc, out, err = run_applescript(build("file", staged))
         except subprocess.TimeoutExpired:
@@ -466,12 +561,13 @@ def main() -> None:
             # osascript returning 0 proves NOTHING for files — failures
             # surface later in chat.db. Wait for Messages' own copy before
             # touching the staged file, and surface a delivery error loudly.
-            copied, msg_err = wait_for_copy(staged)
+            chat_ident = (args.chat_id.split(";+;")[-1] if args.chat_id else args.to) or None
+            copied, msg_err = wait_for_copy(staged, baseline, chat_ident=chat_ident)
             if msg_err:
                 unstage(staged)
                 parts_failed.append(f"file (Messages error {msg_err} — not delivered)")
             elif copied:
-                unstage(staged)
+                keep_sent(staged)
                 print("file: sent.")
             else:
                 # Copy not observed yet: leave staging for the hourly GC —
