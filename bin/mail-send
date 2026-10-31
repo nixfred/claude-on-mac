@@ -52,16 +52,39 @@ import sys
 
 # ---------- dash scrub (no-dashes editorial rule) ----------
 
-DASH_RE = re.compile(r"\s*[\u2014\u2013\u2015]\s*")
-DDASH_RE = re.compile(r"\s*--\s*")
+# A dash is scrubbed only where it reads as one: horizontal whitespace only, so
+# line breaks survive; `--` only when it stands alone (a flag, a URL slug or
+# `a--b` is not a dash); the `-- ` signature separator is left alone.
+# Keep this block identical in bin/imsg-send (tests/test_dash_scrub.py pins both).
+DASH_RE = re.compile(r"[ \t]*(?:[\u2014\u2013\u2015]|(?<!\S)--(?!\S))[ \t]*")
+LEAD_DASH_RE = re.compile(r"^([ \t]*)(?:[\u2014\u2013\u2015]|--(?=[ \t]))[ \t]*(?=\S)")
+SIG_SEP_RE = re.compile(r"--[ \t]*\r?")
 
 
 def scrub_dashes(text: str) -> tuple[str, int]:
-    n = len(DASH_RE.findall(text)) + len(DDASH_RE.findall(text))
-    out = DASH_RE.sub(", ", text)
-    out = DDASH_RE.sub(", ", out)
-    out = re.sub(r",\s*,", ",", out)
-    return out, n
+    """Replace em/en/horizontal-bar dashes and a standalone `--` with `, `.
+
+    A dash that opens a line becomes `- ` so lists keep their shape. Line
+    breaks, URLs, command flags and the `-- ` signature separator are untouched."""
+    n = 0
+    out = []
+    for line in text.split("\n"):
+        if SIG_SEP_RE.fullmatch(line):
+            out.append(line)
+            continue
+        line, k = LEAD_DASH_RE.subn(r"\1- ", line)
+        n += k
+
+        def swap(m, line=line):
+            before, after = line[:m.start()], line[m.end():]
+            if after in ("", "\r"):  # the dash ends the line: no trailing space
+                return "" if before.endswith(",") else ","
+            return " " if before.endswith(",") else ", "
+
+        line, k = DASH_RE.subn(swap, line)
+        n += k
+        out.append(line)
+    return "\n".join(out), n
 
 
 # ---------- AppleScript runner ----------
@@ -248,7 +271,7 @@ def cmd_compose(args):
         if args.cc: print(f"cc      : {args.cc}")
         if args.bcc: print(f"bcc     : {args.bcc}")
         print(f"subject : {args.subject!r}")
-        print(f"body    : {body[:200]!r}{'...' if len(body) > 200 else ''}")
+        print(f"body    : {body!r}")  # all of it: the end of an email is where a mangled signature hides
         print("AppleScript:")
         for line in script.splitlines():
             print(f"  {line}")
@@ -323,7 +346,7 @@ def cmd_reply(args):
         print(f"reply-all : {bool(args.reply_all)}")
         print(f"match     : {match_label}")
         print(f"from      : {sender_label}")
-        print(f"body      : {body[:200]!r}{'...' if len(body) > 200 else ''}")
+        print(f"body      : {body!r}")
         print("AppleScript:")
         for line in script.splitlines():
             print(f"  {line}")

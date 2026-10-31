@@ -60,7 +60,7 @@ Pause and ask. The cost of asking is one round-trip. The cost of an unwanted sen
 
 ## Auto-scrub: dashes
 
-Drafted messages also auto-scrub em-dashes (`—`), en-dashes (`–`), and `--`, replacing them with `, `. This matches a separate editorial preference. Pass `--keep-dashes` to override on a specific send.
+Drafted messages also auto-scrub em-dashes (`—`), en-dashes (`–`), and a standalone `--`, replacing them with `, ` (a dash that opens a line becomes `- `, so lists keep their shape). Flags such as `--oneline`, URLs that contain `--` and the `-- ` signature separator are left as written, and line breaks are never touched. This matches a separate editorial preference. Pass `--keep-dashes` to override on a specific send.
 
 ## Audit trail
 

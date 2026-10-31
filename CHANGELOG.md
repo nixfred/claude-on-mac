@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.0.1 , 2026-10-31
+
+### Fixed
+- **The no-dashes scrub only touches dashes** (#8, thanks @mattabate, who reported it). `scrub_dashes` in `imsg-send` and `mail-send` replaced every `--` and used `\s`, which matches a newline, so a message was mangled in three ways:
+  - `git log --oneline` went out as `git log, oneline`, and a link such as `https://example.com/a--b` became a broken `https://example.com/a, b`. A `--` now counts as a dash only when it stands alone between spaces.
+  - The `-- ` signature separator was swallowed along with the line breaks around it (`Thanks\n\n-- \nFred` went out as `Thanks, Fred`), and an em-dash list collapsed onto one line. Only spaces and tabs are eaten now, a lone `--` line is left as written, and a dash that opens a line becomes `- ` so a list stays a list.
+  - A final pass collapsed any `,\s*,`, so commas the author had typed (`a,,b`) lost one, and a comma at the end of a line joined the comma at the start of a later line, across blank lines. Only the comma next to a dash is merged now.
+- **`mail-send` dry run shows the whole body.** It printed the first 200 characters, so the end of an email, where a signature or a closing line sits, went out unseen after a "yes" that was meant to cover it. Applies to `compose` and `reply`.
+
+### Added
+- `tests/test_dash_scrub.py`: 27 cases run against both copies of `scrub_dashes`, plus a check that the two copies agree.
+
+### Known, tracked
+- `mail-send reply --to-search` picks by Mail's mailbox order, not the most recent match, and the dry run never shows which message it will answer (#7). The fix is designed and open for a contributor PR.
+
 ## v2.0.0 , 2026-09-16
 
 Everything [Blip](https://github.com/nixfred/blip) learned running these helpers against a real chat.db every few seconds for two weeks, brought home. Blip vendored `imsg`, `imsg-send`, `contacts` and `tcc-check` at v1.11.0 and fixed them in place; this release makes claude-on-mac the source again. Thanks to the Blip contributors whose bugs these were (GitHub logins): @Fileri, @adamgamble, @zachwilke, @jefehoser, @johanthoren, @tolewis, @ianswope, and the reporters @jacobaross and @cjoh.

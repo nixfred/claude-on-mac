@@ -46,17 +46,39 @@ CHAT_DB = os.path.expanduser("~/Library/Messages/chat.db")
 MAX_LEN = 4000
 
 # Per the no-dashes editorial rule (see CONSENT.md). Override with --keep-dashes.
-DASH_CHARS = ("\u2014", "\u2013", "\u2015")  # em, en, horizontal-bar
+# A dash is scrubbed only where it reads as one: horizontal whitespace only, so
+# line breaks survive; `--` only when it stands alone (a flag, a URL slug or
+# `a--b` is not a dash); the `-- ` signature separator is left alone.
+# Keep this block identical in bin/mail-send (tests/test_dash_scrub.py pins both).
+DASH_RE = re.compile(r"[ \t]*(?:[\u2014\u2013\u2015]|(?<!\S)--(?!\S))[ \t]*")
+LEAD_DASH_RE = re.compile(r"^([ \t]*)(?:[\u2014\u2013\u2015]|--(?=[ \t]))[ \t]*(?=\S)")
+SIG_SEP_RE = re.compile(r"--[ \t]*\r?")
 
 
 def scrub_dashes(text: str) -> tuple[str, int]:
-    """Replace em/en/horizontal-bar dashes (and `--`) with `, `, eating
-    surrounding whitespace so the result reads cleanly."""
-    n = sum(text.count(ch) for ch in DASH_CHARS) + len(re.findall(r"\s*--\s*", text))
-    out = re.sub(r"\s*[\u2014\u2013\u2015]\s*", ", ", text)
-    out = re.sub(r"\s*--\s*", ", ", out)
-    out = re.sub(r",\s*,", ",", out)
-    return out, n
+    """Replace em/en/horizontal-bar dashes and a standalone `--` with `, `.
+
+    A dash that opens a line becomes `- ` so lists keep their shape. Line
+    breaks, URLs, command flags and the `-- ` signature separator are untouched."""
+    n = 0
+    out = []
+    for line in text.split("\n"):
+        if SIG_SEP_RE.fullmatch(line):
+            out.append(line)
+            continue
+        line, k = LEAD_DASH_RE.subn(r"\1- ", line)
+        n += k
+
+        def swap(m, line=line):
+            before, after = line[:m.start()], line[m.end():]
+            if after in ("", "\r"):  # the dash ends the line: no trailing space
+                return "" if before.endswith(",") else ","
+            return " " if before.endswith(",") else ", "
+
+        line, k = DASH_RE.subn(swap, line)
+        n += k
+        out.append(line)
+    return "\n".join(out), n
 
 
 def detect_self_handles() -> list[str]:
