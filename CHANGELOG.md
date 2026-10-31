@@ -113,6 +113,9 @@ Attachments cross the bridge, both directions. Driven by Blip Tier 2; every mech
 ### Changed
 - **Recently Deleted is hidden by default.** macOS keeps deleted messages in a 30-day bin (`chat_recoverable_message_join`) that is still in `chat.db`, and iCloud syncs phone-side deletions into it. Every `imsg` read used to include those rows, so a conversation you deleted on your iPhone kept showing up for a month. `recent`/`from`/`thread`/`search` now read through a subquery that excludes them. `IMSG_INCLUDE_DELETED=1` restores the old behaviour. `contacts`/`chats`/`analyze` still count deleted rows toward last-activity and totals.
 
+### Fixed
+- **`imsg --json recent 5` honors the flag** (#1, thanks @brianwhitman71-cell and Daisy). `--json`, `--chrono` and `--no-names` placed before the subcommand were accepted and then silently dropped: the subparser's `store_true` default (`False`) was written into the same namespace after the parent had set `True`. The subparser copies now default to `argparse.SUPPRESS`, so the flags work in either position. (Credit added retroactively on 2026-10-31; the fix merged 2026-08-23 and shipped in this release.)
+
 
 ## v1.3.0 , 2026-04-20
 
