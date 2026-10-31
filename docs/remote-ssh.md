@@ -159,7 +159,7 @@ ssh "$CLAUDE_ON_MAC_TARGET" \
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `ssh: connect … Operation timed out` | Mac is asleep (or lid closed on a laptop) | Enable "Prevent automatic sleeping when the display is off"; or run `caffeinate -d` on the Mac; or ignore if intermittent use is acceptable. |
+| `ssh: connect … Operation timed out` | Mac is asleep (or lid closed on a laptop) | Enable "Prevent automatic sleeping when the display is off"; or run `caffeinate -d` on the Mac; or ignore if intermittent use is acceptable. Neither stops lid-close sleep: a closed laptop stays awake only with power, an external display and a keyboard or mouse connected, or after `sudo pmset -a disablesleep 1` (on battery too, and it stays on after a restart until `sudo pmset -a disablesleep 0`; `pmset -g \| grep SleepDisabled` shows `1` while it is on). |
 | Command hangs indefinitely | Stale ControlMaster socket after network change | `ssh -O exit "$CLAUDE_ON_MAC_TARGET"` then retry. |
 | AppleScript error `-1743` | Automation grant missing under sshd TCC context | Re-do §3 (warming) for the specific app. |
 | `command not found: imsg` on the remote | Mac's non-interactive SSH PATH lacks `~/bin` | §4 above: add `export PATH="$HOME/bin:$PATH"` to `~/.zshenv` or `~/.bash_profile` on the Mac. |
